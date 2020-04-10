@@ -31,6 +31,7 @@ import org.apache.zookeeper.CreateMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 
 import com.linkedin.datastream.common.Datastream;
@@ -39,6 +40,7 @@ import com.linkedin.datastream.common.ErrorLogger;
 import com.linkedin.datastream.common.zk.ZkClient;
 import com.linkedin.datastream.server.DatastreamTask;
 import com.linkedin.datastream.server.DatastreamTaskImpl;
+import com.linkedin.datastream.server.HostTargetAssignment;
 
 
 /**
@@ -62,8 +64,11 @@ import com.linkedin.datastream.server.DatastreamTaskImpl;
  * │                     │          │                                         │         │   ┌───────────────────────┐
  * │                     │          │                                         │         │───▶ onLiveInstancesChange*│
  * │                     │          │                                         │         │   └───────────────────────┘
+ * │                     │          │                                         │         │   ┌───────────────────┐
+ * │                     │          │                                         │         │───▶ onDatastreamUpdate│
+ * │                     │          │                                         │         │   └───────────────────┘
  * │                     │          │                                         └─────────┤   ┌────────────────────┐
- * │                     │          │                                                   │───▶ onDatastreamUpdate │
+ * │                     │          │                                                   │───▶ onPartitionMovement|
  * │                     │          │                                                   │   └────────────────────┘
  * └─────────────────────┘          └───────────────────────────────────────────────────┘
  *
@@ -102,30 +107,33 @@ public class ZkAdapter {
 
   private final String _defaultTransportProviderName;
 
-  private String _zkServers;
-  private String _cluster;
-  private int _sessionTimeout;
-  private int _connectionTimeout;
+  private final String _zkServers;
+  private final String _cluster;
+  private final int _sessionTimeoutMs;
+  private final int _connectionTimeoutMs;
+  private final int _operationRetryTimeoutMs;
   private ZkClient _zkclient;
 
   private String _instanceName;
   private String _liveInstanceName;
   private String _hostname;
+  private Set<String> _connectorTypes = new HashSet<>();
 
   private volatile boolean _isLeader = false;
-  private ZkAdapterListener _listener;
+  private final ZkAdapterListener _listener;
 
   // the current znode this node is listening to
   private String _currentSubscription = null;
 
-  private Random randomGenerator = new Random();
+  private final Random randomGenerator = new Random();
 
-  private ZkLeaderElectionListener _leaderElectionListener = new ZkLeaderElectionListener();
+  private ZkLeaderElectionListener _leaderElectionListener;
   private ZkBackedTaskListProvider _assignmentList = null;
 
   // only the leader should maintain this list and listen to the changes of live instances
   private ZkBackedDMSDatastreamList _datastreamList = null;
   private ZkBackedLiveInstanceListProvider _liveInstancesProvider = null;
+  private ZkTargetAssignmentProvider _targetAssignmentProvider = null;
 
   // Cache all live DatastreamTasks per instance for assignment strategy
   private Map<String, Set<DatastreamTask>> _liveTaskMap = new HashMap<>();
@@ -135,18 +143,36 @@ public class ZkAdapter {
    * @param zkServers ZooKeeper server address to connect to
    * @param cluster Brooklin cluster this instance belongs to
    * @param defaultTransportProviderName Default transport provider to use for a newly created task
-   * @param sessionTimeout Session timeout to use for the connection with the ZooKeeper server
-   * @param connectionTimeout Connection timeout to use for the connection with the ZooKeeper server
+   * @param sessionTimeoutMs Session timeout to use for the connection with the ZooKeeper server
+   * @param connectionTimeoutMs Connection timeout to use for the connection with the ZooKeeper server
+   * @param operationRetryTimeoutMs Timeout to use for retrying failed retriable operations. A value lesser than 0 is
+   *                         considered as retry forever until a connection has been reestablished.
    * @param listener ZKAdapterListener implementation to receive callbacks based on various znode changes
    */
-  public ZkAdapter(String zkServers, String cluster, String defaultTransportProviderName, int sessionTimeout,
-      int connectionTimeout, ZkAdapterListener listener) {
+  public ZkAdapter(String zkServers, String cluster, String defaultTransportProviderName, int sessionTimeoutMs,
+      int connectionTimeoutMs, int operationRetryTimeoutMs, ZkAdapterListener listener) {
     _zkServers = zkServers;
     _cluster = cluster;
-    _sessionTimeout = sessionTimeout;
-    _connectionTimeout = connectionTimeout;
+    _sessionTimeoutMs = sessionTimeoutMs;
+    _connectionTimeoutMs = connectionTimeoutMs;
+    _operationRetryTimeoutMs = operationRetryTimeoutMs;
     _listener = listener;
     _defaultTransportProviderName = defaultTransportProviderName;
+  }
+
+  /**
+   * Constructor
+   * @param zkServers ZooKeeper server address to connect to
+   * @param cluster Brooklin cluster this instance belongs to
+   * @param defaultTransportProviderName Default transport provider to use for a newly created task
+   * @param sessionTimeoutMs Session timeout to use for the connection with the ZooKeeper server
+   * @param connectionTimeoutMs Connection timeout to use for the connection with the ZooKeeper server
+   * @param listener ZKAdapterListener implementation to receive callbacks based on various znode changes
+   */
+  public ZkAdapter(String zkServers, String cluster, String defaultTransportProviderName, int sessionTimeoutMs,
+      int connectionTimeoutMs, ZkAdapterListener listener) {
+    this(zkServers, cluster, defaultTransportProviderName, sessionTimeoutMs, connectionTimeoutMs, -1,
+        listener);
   }
 
   /**
@@ -185,9 +211,15 @@ public class ZkAdapter {
         }
         _zkclient.close();
         _zkclient = null;
+        _leaderElectionListener = null;
       }
     }
     // isLeader will be reinitialized when we reconnect
+  }
+
+  @VisibleForTesting
+  ZkClient createZkClient() {
+    return new ZkClient(_zkServers, _sessionTimeoutMs, _connectionTimeoutMs, _operationRetryTimeoutMs);
   }
 
   /**
@@ -195,7 +227,10 @@ public class ZkAdapter {
    * the actions that need to be taken with them, which are implemented in the Coordinator class
    */
   public void connect() {
-    _zkclient = new ZkClient(_zkServers, _sessionTimeout, _connectionTimeout);
+    disconnect(); // Guard against leaking an existing zookeeper session
+    _zkclient = createZkClient();
+
+    _leaderElectionListener = new ZkLeaderElectionListener();
 
     // create a globally unique instance name and create a live instance node in ZooKeeper
     _instanceName = createLiveInstanceNode();
@@ -219,6 +254,7 @@ public class ZkAdapter {
 
     _datastreamList = new ZkBackedDMSDatastreamList();
     _liveInstancesProvider = new ZkBackedLiveInstanceListProvider();
+    _targetAssignmentProvider = new ZkTargetAssignmentProvider(_connectorTypes);
 
     // Load all existing tasks when we just become the new leader. This is needed
     // for resuming working on the tasks from previous sessions.
@@ -242,6 +278,11 @@ public class ZkAdapter {
     if (_liveInstancesProvider != null) {
       _liveInstancesProvider.close();
       _liveInstancesProvider = null;
+    }
+
+    if (_targetAssignmentProvider != null) {
+      _targetAssignmentProvider.close();
+      _targetAssignmentProvider = null;
     }
 
     _isLeader = false;
@@ -351,32 +392,26 @@ public class ZkAdapter {
 
   /**
    * Delete ZooKeeper znodes for all datastream tasks belonging to a group with a specified task prefix
-   * @param connectors Connectors to look under for datastream tasks to delete
+   * @param connector Connector to which the datastream tasks with the task prefix belong
    * @param taskPrefix Task prefix of the datastream tasks to be deleted
    */
-  public void deleteTasksWithPrefix(Set<String> connectors, String taskPrefix) {
+  public void deleteTasksWithPrefix(String connector, String taskPrefix) {
     Set<String> tasksToDelete = _liveTaskMap.values()
         .stream()
         .flatMap(Collection::stream)
-        .filter(x -> x.getTaskPrefix().equals(taskPrefix))
+        .filter(x -> x.getTaskPrefix().equals(taskPrefix) && x.getConnectorType().equals(connector))
         .map(DatastreamTask::getDatastreamTaskName)
         .collect(Collectors.toSet());
 
-    for (String connector : connectors) {
-      Set<String> allTasks = new HashSet<>(_zkclient.getChildren(KeyBuilder.connector(_cluster, connector)));
-      List<String> deadTasks = allTasks.stream().filter(tasksToDelete::contains).collect(Collectors.toList());
-
-      if (deadTasks.size() > 0) {
-        LOG.info("Cleaning up deprecated connector tasks: {} for connector: {}", deadTasks, connector);
-        for (String task : deadTasks) {
-          deleteConnectorTask(connector, task);
-        }
-      }
+    LOG.info("Cleaning up stale connector tasks: {} for connector: {}",
+        tasksToDelete, connector);
+    for (String taskToDelete : tasksToDelete) {
+      deleteConnectorTask(connector, taskToDelete);
     }
   }
 
   private void deleteConnectorTask(String connector, String taskName) {
-    LOG.info("Trying to delete task" + taskName);
+    LOG.info("Trying to delete connector task " + taskName);
     String path = KeyBuilder.connectorTask(_cluster, connector, taskName);
     if (_zkclient.exists(path) && !_zkclient.deleteRecursive(path)) {
       // Ignore such failure for now
@@ -640,7 +675,7 @@ public class ZkAdapter {
     for (String instance : nodesToRemove.keySet()) {
       Set<String> removed = nodesToRemove.get(instance);
       if (removed.size() > 0) {
-        LOG.info("Instance: {}, removing assignments: ", instance, removed);
+        LOG.info("Instance: {}, removing assignments: {}", instance, removed);
         for (String name : removed) {
           removeTaskNodes(instance, name);
         }
@@ -720,21 +755,39 @@ public class ZkAdapter {
     // create instance node /{cluster}/instance/{instanceName} for keeping instance
     // states, including instance assignments and errors
     //
-    String instanceName = _hostname + "-" + _liveInstanceName;
+    String instanceName = formatZkInstance(_hostname, _liveInstanceName);
     _zkclient.ensurePath(KeyBuilder.instance(_cluster, instanceName));
     _zkclient.ensurePath(KeyBuilder.instanceAssignments(_cluster, instanceName));
     _zkclient.ensurePath(KeyBuilder.instanceErrors(_cluster, instanceName));
 
-    return _hostname + "-" + _liveInstanceName;
+    return formatZkInstance(_hostname, _liveInstanceName);
   }
 
   /**
-   * Recursively create the znodes in ZooKeeper for the {@code /{cluster}/{connectorType}} node if it doesn't exist
+   * Add connector type to this ZkAdapter, it also recursively creates the znodes in ZooKeeper for
+   * the {@code /{cluster}/{connectorType}} node if it doesn't exist
    * @param connectorType Connector type
    */
-  public void ensureConnectorZNode(String connectorType) {
+  public void addConnectorType(String connectorType) {
+    _connectorTypes.add(connectorType);
     String path = KeyBuilder.connector(_cluster, connectorType);
     _zkclient.ensurePath(path);
+    if (_targetAssignmentProvider != null) {
+      _targetAssignmentProvider.addListener(connectorType);
+    }
+  }
+
+  /**
+   * Get all connectors in the cluster.
+   */
+  private List<String> getAllConnectors() {
+    String path = KeyBuilder.connectors(_cluster);
+    _zkclient.ensurePath(path);
+    return _zkclient.getChildren(path);
+  }
+
+  private Set<String> getConnectorTasks(String connector) {
+    return new HashSet<>(_zkclient.getChildren(KeyBuilder.connector(_cluster, connector)));
   }
 
   /**
@@ -811,9 +864,7 @@ public class ZkAdapter {
           LOG.warn("Failed to remove zk path: {} Very likely that the zk node doesn't exist anymore", path);
         }
 
-        if (_liveTaskMap.containsKey(instance)) {
-          _liveTaskMap.remove(instance);
-        }
+        _liveTaskMap.remove(instance);
       }
     }
   }
@@ -833,11 +884,53 @@ public class ZkAdapter {
         previousAssignmentByInstance.values().stream().flatMap(Collection::stream).collect(Collectors.toSet());
     List<DatastreamTask> unusedTasks =
         oldTasks.stream().filter(x -> !newTasks.contains(x)).collect(Collectors.toList());
-    LOG.warn("Deleting the unused tasks {} found between previous {} and new assignment {}. ", unusedTasks,
-        previousAssignmentByInstance, newAssignmentsByInstance);
+    LOG.info("Deleting the unused tasks {} ", unusedTasks);
 
     // Delete the connector tasks.
     unusedTasks.forEach(t -> deleteConnectorTask(t.getConnectorType(), t.getDatastreamTaskName()));
+  }
+
+  /**
+   * Remove orphan connector task nodes which are not assigned to any instance (live or paused).
+   *
+   * NOTE: this should be called after the valid tasks have been reassigned or become safe to discard per
+   * strategy requirement.
+   * This is a costly operation which involves getting all children of /cluster/connectors from Zookeeper. So,
+   * it should be called only once the leader gets
+   * elected and has finished the assignment and cleaned up dead
+   * Tasks. Ideally, we should not find anything in this check to clean up.
+   * @param cleanUpOrphanTasksInConnector Boolean whether orphan tasks should be removed from zookeeper or just
+   *                                      print warning logs.
+   */
+  public int cleanUpOrphanConnectorTasks(boolean cleanUpOrphanTasksInConnector) {
+    if (!_isLeader) {
+      return 0;
+    }
+
+    Map<String, Set<DatastreamTask>> assignmentsByInstance = getAllAssignedDatastreamTasks();
+
+    Set<DatastreamTask> validTasks =
+        assignmentsByInstance.values().stream().flatMap(Collection::stream).collect(Collectors.toSet());
+
+    List<String> allConnectors = getAllConnectors();
+    int orphanCount = 0;
+    for (String connector : allConnectors) {
+      Set<String> connectorTaskList = getConnectorTasks(connector);
+
+      connectorTaskList.removeAll(validTasks.stream()
+          .filter(x -> x.getConnectorType().equals(connector))
+          .map(DatastreamTask::getDatastreamTaskName)
+          .collect(Collectors.toSet()));
+
+      if (connectorTaskList.size() > 0) {
+        LOG.warn("Found orphan tasks: {} in connector: {}", connectorTaskList, connector);
+        if (cleanUpOrphanTasksInConnector) {
+          connectorTaskList.forEach(t -> deleteConnectorTask(connector, t));
+        }
+      }
+      orphanCount += connectorTaskList.size();
+    }
+    return orphanCount;
   }
 
   private void waitForTaskRelease(DatastreamTask task, long timeoutMs, String lockPath) {
@@ -845,22 +938,23 @@ public class ZkAdapter {
     CountDownLatch busyLatch = new CountDownLatch(1);
 
     String lockNode = lockPath.substring(lockPath.lastIndexOf('/') + 1);
-    String taskPath = KeyBuilder.connectorTask(_cluster, task.getConnectorType(), task.getDatastreamTaskName());
+    String lockRootPath = KeyBuilder.datastreamTaskLockRoot(_cluster, task.getConnectorType());
 
     if (_zkclient.exists(lockPath)) {
       IZkChildListener listener = (parentPath, currentChildren) -> {
-        if (!currentChildren.contains(lockNode)) {
+      if (!currentChildren.contains(lockNode)) {
           busyLatch.countDown();
         }
       };
 
       try {
-        _zkclient.subscribeChildChanges(taskPath, listener);
+        _zkclient.subscribeChildChanges(lockRootPath, listener);
         busyLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
       } catch (InterruptedException e) {
-        LOG.warn("Unexpectedly interrupted during task acquire.", e);
+        String errorMsg = "Unexpectedly interrupted during task acquire.";
+        ErrorLogger.logAndThrowDatastreamRuntimeException(LOG, errorMsg, e);
       } finally {
-        _zkclient.unsubscribeChildChanges(taskPath, listener);
+        _zkclient.unsubscribeChildChanges(lockRootPath, listener);
       }
     }
   }
@@ -875,6 +969,7 @@ public class ZkAdapter {
    * @see #releaseTask(DatastreamTaskImpl)
    */
   public void acquireTask(DatastreamTaskImpl task, Duration timeout) {
+    _zkclient.ensurePath(KeyBuilder.datastreamTaskLockRoot(_cluster, task.getConnectorType()));
     String lockPath = KeyBuilder.datastreamTaskLock(_cluster, task.getConnectorType(), task.getDatastreamTaskName());
     String owner = null;
     if (_zkclient.exists(lockPath)) {
@@ -898,6 +993,113 @@ public class ZkAdapter {
   }
 
   /**
+   * Check if the task is currently locked
+   */
+  public boolean checkIsTaskLocked(String connectorType, String taskName) {
+    String lockPath = KeyBuilder.datastreamTaskLock(_cluster, connectorType, taskName);
+    return (_zkclient.exists(lockPath));
+  }
+
+  /**
+   * Wait for all dependencies to be cleared. It's a blocking call
+   * @param task Datastream task whose dependencies need to be checked
+   * @param timeout max wait time to wait for a locked task for releasing
+   */
+  public void waitForDependencies(DatastreamTaskImpl task, Duration timeout) {
+    task.getDependencies().forEach(previousTask -> {
+        String lockPath = KeyBuilder.datastreamTaskLock(_cluster, task.getConnectorType(), previousTask);
+      if (_zkclient.exists(lockPath)) {
+        waitForTaskRelease(task, timeout.toMillis(), lockPath);
+      }
+    });
+  }
+
+  /**
+   * Clean up partition movement info for a particular datastream
+   * @param connectorType Connector name
+   * @param datastreamGroupName the name of datastream group
+   * @param timestamp timestamp of the partition movement, we only removed node before this timestamp
+   */
+  public void cleanUpPartitionMovement(String connectorType, String datastreamGroupName, long timestamp) {
+    String path = KeyBuilder.getTargetAssignmentPath(_cluster, connectorType, datastreamGroupName);
+    if (_zkclient.exists(path)) {
+      List<String> nodes = _zkclient.getChildren(path);
+      for (String node : nodes) {
+        if (Long.parseLong(node) < timestamp) {
+          _zkclient.deleteRecursive(path + '/' + node);
+        }
+      }
+    }
+    LOG.info("clean up Target assignment info for {}", datastreamGroupName);
+  }
+
+  /**
+   * Get the datastream group which contains the partition movement info
+   * @param connectorType Connector name
+   */
+  public List<String> getDatastreamsNeedPartitionMovement(String connectorType) {
+    String path = KeyBuilder.getTargetAssignmentBase(_cluster, connectorType);
+    if (_zkclient.exists(path)) {
+      return _zkclient.getChildren(path);
+    }
+    return Collections.emptyList();
+  }
+
+  /**
+   * Get a partition movement info for a particular datastream, if there are multiple assignment for the a single
+   * partition, we process the one which has the last timestamp (last write win)
+   *
+   * @param connectorType Connector name
+   * @param datastreamGroupName the name of datastream group
+   * @param timestamp timestamp of this partition movement request, we only processed the node before this timestamp
+   * @return The target assignment mapping information with the instance name -> topicPartition
+   */
+  public Map<String, Set<String>> getPartitionMovement(String connectorType, String datastreamGroupName,
+      long timestamp) {
+    Map<String, Set<String>> result = new HashMap<>();
+
+    String path = KeyBuilder.getTargetAssignmentPath(_cluster, connectorType, datastreamGroupName);
+    if (_zkclient.exists(path)) {
+      List<String> nodes = _zkclient.getChildren(path);
+
+      // Node contains the timestamp info for each assignment, we sort them so that last write win
+      Collections.sort(nodes, Collections.reverseOrder());
+
+      Map<String, String> hostInstanceMap = getHostInstanceMap();
+
+      // keep remember processed partitions so that the same partition will not be assigned twice
+      Set<String> processedPartitions = new HashSet<>();
+
+      for (String node : nodes) {
+        // ignore nodes after this timestamp, which is the staged after the movement request
+        if (Long.parseLong(node) > timestamp) {
+          continue;
+        }
+
+        String content = _zkclient.readData(path + '/' + node);
+        HostTargetAssignment assignment = HostTargetAssignment.fromJson(content);
+        List<String> hostPartitions = new ArrayList<>(assignment.getPartitionNames());
+        // Remove partitions which has been processed already
+        hostPartitions.removeAll(processedPartitions);
+        processedPartitions.addAll(assignment.getPartitionNames());
+
+        // Map the hostname to correct Zookeeper instance name
+        if (hostInstanceMap.containsKey(assignment.getTargetHost()) && assignment.getPartitionNames() != null) {
+          LOG.info("Added assignment {} {}", assignment.getTargetHost(), hostPartitions);
+          if (result.containsKey(hostInstanceMap.get(assignment.getTargetHost()))) {
+            result.get(hostInstanceMap.get(assignment.getTargetHost())).addAll(hostPartitions);
+          } else {
+            result.put(hostInstanceMap.get(assignment.getTargetHost()), new HashSet<>(hostPartitions));
+          }
+        } else {
+          LOG.warn("assignment target host {} not found from the live instances {}", assignment.getTargetHost(), hostInstanceMap.keySet());
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
    * Release the datastream task lock previously acquired
    * @param task Datastream task to release exclusive access for
    * @see #acquireTask(DatastreamTaskImpl, Duration)
@@ -917,6 +1119,27 @@ public class ZkAdapter {
 
     _zkclient.delete(lockPath);
     LOG.info("{} successfully released the lock on {}", _instanceName, task);
+  }
+
+  private Map<String, String> getHostInstanceMap() {
+    Map<String, String> hostInstanceMap = new HashMap<>();
+    if (this.getLiveInstances() != null) {
+      this.getLiveInstances().forEach(instance ->
+          hostInstanceMap.put(parseHostnameFromZkInstance(instance), instance)
+      );
+    }
+    return hostInstanceMap;
+  }
+
+  private static String formatZkInstance(String hostname, String instanceName) {
+    return String.format("%s-%s", hostname, instanceName);
+  }
+
+  /**
+   * Parse the Zk instance (ex. hostname-0000) into hostname
+   */
+  public static String parseHostnameFromZkInstance(String instance) {
+    return instance.substring(0, instance.lastIndexOf('-'));
   }
 
   /**
@@ -957,6 +1180,12 @@ public class ZkAdapter {
      * happen after a datastream update.
      */
     void onDatastreamUpdate();
+
+    /**
+     * onPartitionMovement is called when partition movement info has been put into zookeeper
+     * @param notifyTimestamp the timestamp that partitionMovement is triggered
+     */
+    void onPartitionMovement(Long notifyTimestamp);
   }
 
   /**
@@ -964,7 +1193,7 @@ public class ZkAdapter {
    * ZooKeeper znodes under <i>/{cluster}/dms/</i>.
    */
   public class ZkBackedDMSDatastreamList implements IZkChildListener, IZkDataListener {
-    private String _path;
+    private final String _path;
 
     /**
      * Sets up a watch on the {@code /{cluster}/dms} tree, so it can be notified of future changes.
@@ -1031,7 +1260,7 @@ public class ZkAdapter {
    */
   public class ZkBackedLiveInstanceListProvider implements IZkChildListener {
     private List<String> _liveInstances = new ArrayList<>();
-    private String _path;
+    private final String _path;
 
     /**
      * Sets up a watch on the {@code /{cluster}/liveinstances} tree, so it can be notified
@@ -1051,10 +1280,11 @@ public class ZkAdapter {
       List<String> liveInstances = new ArrayList<>();
       for (String n : nodes) {
         String hostname = _zkclient.ensureReadData(KeyBuilder.liveInstance(_cluster, n));
-        if (hostname != null) {
+        if (hostname == null) {
           // hostname can be null if a node dies immediately after reading all live instances
           LOG.error("Node {} is dead. Likely cause it dies after reading list of nodes.", n);
-          liveInstances.add(hostname + "-" + n);
+        } else {
+          liveInstances.add(formatZkInstance(hostname, n));
         }
       }
       return liveInstances;
@@ -1146,6 +1376,61 @@ public class ZkAdapter {
       if (_listener != null && data != null && !data.toString().isEmpty()) {
         // only care about the data change when there is an update in the data node
         _listener.onDatastreamUpdate();
+      }
+    }
+
+    @Override
+    public void handleDataDeleted(String dataPath) throws Exception {
+      // do nothing
+    }
+  }
+
+  /**
+   * ZkTargetAssignmentProvider detect if there is a partition movement being intiated from restful endpoint
+   */
+  public class ZkTargetAssignmentProvider implements IZkDataListener {
+    Set<String> _listenedConnectors = new HashSet<>();
+    /**
+     * Constructor
+     */
+    public ZkTargetAssignmentProvider(Set<String> connectorTypes) {
+      for (String connectorType : connectorTypes) {
+        String path = KeyBuilder.getTargetAssignmentBase(_cluster, connectorType);
+        _zkclient.subscribeDataChanges(path, this);
+        LOG.info("ZkTargetAssignmentProvider::Subscribing to the changes under the path " + path);
+      }
+      _listenedConnectors.addAll(connectorTypes);
+    }
+
+    /**
+     * add listener for the connector
+     */
+    public void addListener(String connectorType) {
+      if (!_listenedConnectors.contains(connectorType)) {
+        String path = KeyBuilder.getTargetAssignmentBase(_cluster, connectorType);
+        _zkclient.subscribeDataChanges(path, this);
+        LOG.info("ZkTargetAssignmentProvider::Subscribing to the changes under the path " + path);
+        _listenedConnectors.add(connectorType);
+      }
+    }
+
+    /**
+     * Unsubscribe to all changes to the task assignment for this instance.
+     */
+    public void close() {
+      for (String connectorType : _listenedConnectors) {
+        String path = KeyBuilder.getTargetAssignmentBase(_cluster, connectorType);
+        _zkclient.unsubscribeDataChanges(path, this);
+        LOG.info("ZkTargetAssignmentProvider::Unsubscribing to the changes under the path " + path);
+      }
+    }
+
+    @Override
+    public void handleDataChange(String dataPath, Object data) throws Exception {
+      LOG.info("ZkTargetAssignmentProvider::Received Data change notification on the path {}, data {}.", dataPath, data);
+      if (_listener != null && data != null && !data.toString().isEmpty()) {
+        // data consists of the timestamp when partition movement is triggered from the client
+        _listener.onPartitionMovement(Long.valueOf(data.toString()));
       }
     }
 

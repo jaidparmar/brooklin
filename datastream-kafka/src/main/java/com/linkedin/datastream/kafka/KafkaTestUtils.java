@@ -30,7 +30,7 @@ import kafka.utils.ZkUtils;
  */
 public final class KafkaTestUtils {
   private static final int DEFAULT_TIMEOUT_MS = 60000;
-  private static AtomicInteger _groupCounter = new AtomicInteger();
+  private static final AtomicInteger GROUP_COUNTER = new AtomicInteger();
 
 
   /**
@@ -91,7 +91,7 @@ public final class KafkaTestUtils {
       consumer.subscribe(Collections.singleton(topic));
       while (Instant.now().isBefore(expiration)) {
         try {
-          consumer.poll(Duration.ofSeconds(1));
+          consumer.poll(Duration.ofSeconds(1).toMillis());
           return;
         } catch (Exception ignored) {
           // Exception should occur when we are waiting for the broker to be assigned this topic
@@ -142,7 +142,7 @@ public final class KafkaTestUtils {
   private static KafkaConsumer<byte[], byte[]> createConsumer(String brokerList) {
 
     Properties props = new Properties();
-    String groupId = "test_" + _groupCounter.incrementAndGet();
+    String groupId = "test_" + GROUP_COUNTER.incrementAndGet();
     props.put("bootstrap.servers", brokerList);
     props.put("auto.commit.interval.ms", "1000");
     props.put("session.timeout.ms", "30000");
@@ -151,8 +151,6 @@ public final class KafkaTestUtils {
     props.put("group.id", groupId);
     props.put("auto.offset.reset", "earliest");
 
-
-    KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(props);
-    return consumer;
+    return new KafkaConsumer<>(props);
   }
 }

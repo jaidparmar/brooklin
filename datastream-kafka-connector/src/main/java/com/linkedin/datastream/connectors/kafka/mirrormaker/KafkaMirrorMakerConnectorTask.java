@@ -5,6 +5,7 @@
  */
 package com.linkedin.datastream.connectors.kafka.mirrormaker;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -14,12 +15,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.record.TimestampType;
@@ -31,9 +35,10 @@ import com.google.common.annotations.VisibleForTesting;
 import com.linkedin.datastream.common.BrooklinEnvelope;
 import com.linkedin.datastream.common.BrooklinEnvelopeMetadataConstants;
 import com.linkedin.datastream.common.DatastreamConstants;
+import com.linkedin.datastream.common.DatastreamMetadataConstants;
+import com.linkedin.datastream.common.DatastreamRuntimeException;
 import com.linkedin.datastream.common.ReflectionUtils;
 import com.linkedin.datastream.common.VerifiableProperties;
-import com.linkedin.datastream.connectors.CommonConnectorMetrics;
 import com.linkedin.datastream.connectors.kafka.AbstractKafkaBasedConnectorTask;
 import com.linkedin.datastream.connectors.kafka.GroupIdConstructor;
 import com.linkedin.datastream.connectors.kafka.KafkaBasedConnectorConfig;
@@ -42,14 +47,18 @@ import com.linkedin.datastream.connectors.kafka.KafkaConnectionString;
 import com.linkedin.datastream.connectors.kafka.KafkaConsumerFactory;
 import com.linkedin.datastream.connectors.kafka.KafkaDatastreamStatesResponse;
 import com.linkedin.datastream.connectors.kafka.PausedSourcePartitionMetadata;
+import com.linkedin.datastream.connectors.kafka.TopicPartitionUtil;
 import com.linkedin.datastream.metrics.BrooklinCounterInfo;
 import com.linkedin.datastream.metrics.BrooklinGaugeInfo;
 import com.linkedin.datastream.metrics.BrooklinMetricInfo;
+import com.linkedin.datastream.metrics.DynamicMetricsManager;
 import com.linkedin.datastream.metrics.MetricsAware;
 import com.linkedin.datastream.server.DatastreamProducerRecord;
 import com.linkedin.datastream.server.DatastreamProducerRecordBuilder;
 import com.linkedin.datastream.server.DatastreamTask;
 import com.linkedin.datastream.server.FlushlessEventProducerHandler;
+import com.linkedin.datastream.server.api.transport.SendCallback;
+
 
 
 /**
@@ -74,6 +83,8 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
   private static final String KAFKA_ORIGIN_TOPIC = "kafka-origin-topic";
   private static final String KAFKA_ORIGIN_PARTITION = "kafka-origin-partition";
   private static final String KAFKA_ORIGIN_OFFSET = "kafka-origin-offset";
+  private static final Duration LOCK_ACQUIRE_TIMEOUT = Duration.ofMinutes(3);
+  private static final String NUM_LOCK_FAILS = "numLockFails";
 
   // constants for flushless mode and flow control
   protected static final String CONFIG_MAX_IN_FLIGHT_MSGS_THRESHOLD = "maxInFlightMessagesThreshold";
@@ -81,16 +92,19 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
   protected static final String CONFIG_FLOW_CONTROL_ENABLED = "flowControlEnabled";
   private static final long DEFAULT_MAX_IN_FLIGHT_MSGS_THRESHOLD = 5000;
   private static final long DEFAULT_MIN_IN_FLIGHT_MSGS_THRESHOLD = 1000;
+  private static final String DEFAULT_DESTINATION_TOPIC_PREFIX = "";
 
   // constants for topic manager
   public static final String TOPIC_MANAGER_FACTORY = "topicManagerFactory";
   public static final String DEFAULT_TOPIC_MANAGER_FACTORY =
       "com.linkedin.datastream.connectors.kafka.mirrormaker.NoOpTopicManagerFactory";
+  public static final String DESTINATION_TOPIC_PREFIX = "destinationTopicPrefix";
   public static final String DOMAIN_TOPIC_MANAGER = "topicManager";
   public static final String TOPIC_MANAGER_METRICS_PREFIX = "TopicManager";
 
   private final KafkaConsumerFactory<?, ?> _consumerFactory;
   private final KafkaConnectionString _mirrorMakerSource;
+  private final DynamicMetricsManager _dynamicMetricsManager;
 
   // Topic manager can be used to handle topic related tasks that mirror maker connector needs to do.
   // Topic manager is invoked every time there is a new partition assignment (for both partitions assigned and revoked),
@@ -100,13 +114,13 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
   // variables for flushless mode and flow control
   private final boolean _isFlushlessModeEnabled;
   private final boolean _isIdentityMirroringEnabled;
+  private final boolean _enablePartitionAssignment;
+  private final String _destinationTopicPrefix;
   private FlushlessEventProducerHandler<Long> _flushlessProducer = null;
   private boolean _flowControlEnabled = false;
   private long _maxInFlightMessagesThreshold;
   private long _minInFlightMessagesThreshold;
   private int _flowControlTriggerCount = 0;
-
-  private GroupIdConstructor _groupIdConstructor;
 
   /**
    * Constructor for KafkaMirrorMakerConnectorTask
@@ -119,13 +133,22 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
    */
   public KafkaMirrorMakerConnectorTask(KafkaBasedConnectorConfig config, DatastreamTask task, String connectorName,
       boolean isFlushlessModeEnabled, GroupIdConstructor groupIdConstructor) {
-    super(config, task, LOG, generateMetricsPrefix(connectorName, CLASS_NAME));
+    super(config, task, LOG, generateMetricsPrefix(connectorName, CLASS_NAME), groupIdConstructor);
     _consumerFactory = config.getConsumerFactory();
     _mirrorMakerSource = KafkaConnectionString.valueOf(_datastreamTask.getDatastreamSource().getConnectionString());
 
     _isFlushlessModeEnabled = isFlushlessModeEnabled;
     _isIdentityMirroringEnabled = KafkaMirrorMakerDatastreamMetadata.isIdentityPartitioningEnabled(_datastream);
-    _groupIdConstructor = groupIdConstructor;
+    _enablePartitionAssignment = config.getEnablePartitionAssignment();
+    _destinationTopicPrefix = task.getDatastreams().get(0).getMetadata()
+        .getOrDefault(DatastreamMetadataConstants.DESTINATION_TOPIC_PREFIX, DEFAULT_DESTINATION_TOPIC_PREFIX);
+    _dynamicMetricsManager = DynamicMetricsManager.getInstance();
+
+    if (_enablePartitionAssignment) {
+      LOG.info("Enable Brooklin partition assignment");
+    }
+
+    LOG.info("Destination topic prefix has been set to {}", _destinationTopicPrefix);
 
     if (_isFlushlessModeEnabled) {
       _flushlessProducer = new FlushlessEventProducerHandler<>(_producer);
@@ -148,6 +171,9 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
         null != connectorProperties.getProperty(TOPIC_MANAGER_FACTORY)) {
       topicManagerProperties = connectorProperties.getDomainProperties(DOMAIN_TOPIC_MANAGER);
       topicManagerFactoryName = connectorProperties.getProperty(TOPIC_MANAGER_FACTORY);
+      // Propagate the destinationTopicPrefix config to the topic manager so that it can create destination topics
+      // with the same prefix.
+      topicManagerProperties.put(DESTINATION_TOPIC_PREFIX, _destinationTopicPrefix);
     }
 
     TopicManagerFactory topicManagerFactory = ReflectionUtils.createInstance(topicManagerFactoryName);
@@ -161,22 +187,38 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
   protected Consumer<?, ?> createKafkaConsumer(Properties consumerProps) {
     Properties properties = new Properties();
     properties.putAll(consumerProps);
-    String bootstrapValue = String.join(KafkaConnectionString.BROKER_LIST_DELIMITER,
-        _mirrorMakerSource.getBrokers().stream().map(KafkaBrokerAddress::toString).collect(Collectors.toList()));
+    String bootstrapValue = _mirrorMakerSource.getBrokers().stream().map(KafkaBrokerAddress::toString)
+        .collect(Collectors.joining(KafkaConnectionString.BROKER_LIST_DELIMITER));
     properties.putIfAbsent(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapValue);
     properties.putIfAbsent(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG,
         Boolean.FALSE.toString()); // auto-commits are unsafe
     properties.putIfAbsent(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, CONSUMER_AUTO_OFFSET_RESET_CONFIG_EARLIEST);
-    properties.put(ConsumerConfig.GROUP_ID_CONFIG,
-        getMirrorMakerGroupId(_datastreamTask, _groupIdConstructor, _consumerMetrics, LOG));
+    properties.putIfAbsent(ConsumerConfig.GROUP_ID_CONFIG,
+        getKafkaGroupId(_datastreamTask, _groupIdConstructor, _consumerMetrics, LOG));
     LOG.info("Creating Kafka consumer for task {} with properties {}", _datastreamTask, properties);
     return _consumerFactory.createConsumer(properties);
   }
 
   @Override
   protected void consumerSubscribe() {
-    LOG.info("About to subscribe to source: {}", _mirrorMakerSource.getTopicName());
-    _consumer.subscribe(Pattern.compile(_mirrorMakerSource.getTopicName()), this);
+    if (_enablePartitionAssignment) {
+      Set<TopicPartition> topicPartition  = getAssignedTopicPartitionFromTask();
+      updateConsumerAssignment(topicPartition);
+      // Consumer can be assigned with an empty set, but it cannot run poll against it
+      // While it's allowed to assign an empty set here, the check on poll need to be performed
+      _consumer.assign(_consumerAssignment);
+      this.onPartitionsAssignedInternal(topicPartition);
+      // Invoke topic manager
+      handleTopicMangerPartitionAssignment(topicPartition);
+    } else {
+      LOG.info("About to subscribe to source: {}", _mirrorMakerSource.getTopicName());
+      _consumer.subscribe(Pattern.compile(_mirrorMakerSource.getTopicName()), this);
+    }
+  }
+
+  private Set<TopicPartition> getAssignedTopicPartitionFromTask() {
+    return _datastreamTask.getPartitionsV2().stream()
+        .map(TopicPartitionUtil::createTopicPartition).collect(Collectors.toSet());
   }
 
   @Override
@@ -184,7 +226,7 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
     long eventsSourceTimestamp =
         fromKafka.timestampType() == TimestampType.LOG_APPEND_TIME ? fromKafka.timestamp() : readTime.toEpochMilli();
     HashMap<String, String> metadata = new HashMap<>();
-    metadata.put(KAFKA_ORIGIN_CLUSTER, _mirrorMakerSource.toString());
+    metadata.put(KAFKA_ORIGIN_CLUSTER, _mirrorMakerSource.getBrokerListString());
     String topic = fromKafka.topic();
     metadata.put(KAFKA_ORIGIN_TOPIC, topic);
     int partition = fromKafka.partition();
@@ -201,7 +243,8 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
     builder.setSourceCheckpoint(new KafkaMirrorMakerCheckpoint(topic, partition, offset).toString());
     builder.setDestination(_datastreamTask.getDatastreamDestination()
         .getConnectionString()
-        .replace(KafkaMirrorMakerConnector.MM_TOPIC_PLACEHOLDER, topic));
+        .replace(KafkaMirrorMakerConnector.MM_TOPIC_PLACEHOLDER,
+            StringUtils.isBlank(_destinationTopicPrefix) ? topic : _destinationTopicPrefix + topic));
     if (_isIdentityMirroringEnabled) {
       builder.setPartition(partition);
     }
@@ -210,7 +253,7 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
 
   @Override
   protected void sendDatastreamProducerRecord(DatastreamProducerRecord datastreamProducerRecord,
-      TopicPartition srcTopicPartition, int numBytes) {
+      TopicPartition srcTopicPartition, int numBytes, SendCallback sendCallback) {
     if (_isFlushlessModeEnabled) {
       // The topic/partition from checkpoint is the same as srcTopicPartition
       KafkaMirrorMakerCheckpoint sourceCheckpoint =
@@ -220,11 +263,15 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
       _flushlessProducer.send(datastreamProducerRecord, topic, partition, sourceCheckpoint.getOffset(),
           ((metadata, exception) -> {
             if (exception != null) {
-              _logger.warn("Detected exception being throw from callback for src partition: {} while sending producer "
-                  + "record: {}, exception: ", srcTopicPartition, datastreamProducerRecord, exception);
+              _logger.warn(
+                  String.format("Detected exception being throw from callback for src partition: %s while sending producer "
+                      + "record: %s, exception: ", srcTopicPartition, datastreamProducerRecord), exception);
               rewindAndPausePartitionOnException(srcTopicPartition, exception);
             } else {
               _consumerMetrics.updateBytesProcessedRate(numBytes);
+            }
+            if (sendCallback != null) {
+              sendCallback.onCompletion(metadata, exception);
             }
           }));
       if (_flowControlEnabled) {
@@ -243,15 +290,11 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
         }
       }
     } else {
-      super.sendDatastreamProducerRecord(datastreamProducerRecord, srcTopicPartition, numBytes);
+      super.sendDatastreamProducerRecord(datastreamProducerRecord, srcTopicPartition, numBytes, sendCallback);
     }
   }
 
-
-
-  @Override
-  public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
-    super.onPartitionsAssigned(partitions);
+  private void handleTopicMangerPartitionAssignment(Collection<TopicPartition> partitions) {
     Collection<TopicPartition> topicPartitionsToPause = _topicManager.onPartitionsAssigned(partitions);
     // we need to explicitly pause these partitions here and not wait for PreConsumerPollHook.
     // The reason being onPartitionsAssigned() gets called as part of Kafka poll, so we need to pause partitions
@@ -260,6 +303,27 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
     // Chances are that the current poll call will return data already for that topic/partition and we will end up
     // auto creating that topic.
     pauseTopicManagerPartitions(topicPartitionsToPause);
+  }
+
+  @Override
+  public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+    super.onPartitionsAssigned(partitions);
+    handleTopicMangerPartitionAssignment(partitions);
+  }
+
+  @Override
+  public void run() {
+    if (_enablePartitionAssignment) {
+      try {
+        LOG.info("Trying to acquire the lock on datastreamTask: {}", _datastreamTask);
+        _datastreamTask.acquire(LOCK_ACQUIRE_TIMEOUT);
+      } catch (DatastreamRuntimeException ex) {
+        LOG.error(String.format("Failed to acquire lock for datastreamTask %s", _datastreamTask), ex);
+        _dynamicMetricsManager.createOrUpdateMeter(CLASS_NAME, NUM_LOCK_FAILS, 1);
+        throw ex;
+      }
+    }
+    super.run();
   }
 
   @Override
@@ -288,8 +352,8 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
 
   @Override
   protected void maybeCommitOffsets(Consumer<?, ?> consumer, boolean hardCommit) {
+    boolean isTimeToCommit = System.currentTimeMillis() - _lastCommittedTime > _offsetCommitInterval;
     if (_isFlushlessModeEnabled) {
-      boolean isTimeToCommit = System.currentTimeMillis() - _lastCommittedTime > _offsetCommitInterval;
       if (hardCommit) { // hard commit (flush and commit checkpoints)
         LOG.info("Calling flush on the producer.");
         _datastreamTask.getEventProducer().flush();
@@ -302,6 +366,26 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
       }
     } else {
       super.maybeCommitOffsetsInternal(consumer, hardCommit);
+    }
+  }
+
+  @Override
+  protected ConsumerRecords<?, ?> consumerPoll(long pollInterval) {
+    if (_enablePartitionAssignment && _consumerAssignment.isEmpty()) {
+      // Kafka rejects a poll if there is empty assignment
+      return ConsumerRecords.EMPTY;
+    } else {
+      return _consumer.poll(pollInterval);
+    }
+  }
+
+  @Override
+  protected void postShutdownHook() {
+    if (_enablePartitionAssignment) {
+      // The task lock should only be released when it is absolutely safe (we can guarantee that the task cannot
+      // consume any further). The shutdown process must complete and the consumer must be closed.
+      LOG.info("Releasing the lock on datastreamTask: {}", _datastreamTask);
+      _datastreamTask.release();
     }
   }
 
@@ -325,24 +409,6 @@ public class KafkaMirrorMakerConnectorTask extends AbstractKafkaBasedConnectorTa
         generateMetricsPrefix(connectorName, CLASS_NAME) + TOPIC_MANAGER_METRICS_PREFIX + MetricsAware.KEY_REGEX
             + ".*"));
     return metrics;
-  }
-
-  /**
-   * Get Kafka consumer group ID for a datastream task
-   * @param task Datastream task
-   * @param groupIdConstructor Consumer group ID constructor
-   * @param consumerMetrics Consumer metrics to use for error reporting
-   * @param logger Logger to use
-   */
-  @VisibleForTesting
-  public static String getMirrorMakerGroupId(DatastreamTask task, GroupIdConstructor groupIdConstructor,
-      CommonConnectorMetrics consumerMetrics, Logger logger) {
-    try {
-      return groupIdConstructor.getTaskGroupId(task, Optional.of(logger));
-    } catch (Exception e) {
-      consumerMetrics.updateErrorRate(1, "Can't find group ID", e);
-      throw e;
-    }
   }
 
   /**

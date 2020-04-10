@@ -64,13 +64,17 @@ public class EventProducer implements DatastreamEventProducer {
   private static final String FLUSH_LATENCY_MS_STRING = "flushLatencyMs";
   private static final String AVAILABILITY_THRESHOLD_SLA_MS = "availabilityThresholdSlaMs";
   private static final String AVAILABILITY_THRESHOLD_ALTERNATE_SLA_MS = "availabilityThresholdAlternateSlaMs";
+  private static final String WARN_LOG_LATENCY_ENABLED = "warnLogLatencyEnabled";
+  private static final String WARN_LOG_LATENCY_THRESHOLD_MS = "warnLogLatencyThresholdMs";
   private static final String EVENTS_PRODUCED_OUTSIDE_SLA = "eventsProducedOutsideSla";
   private static final String EVENTS_PRODUCED_OUTSIDE_ALTERNATE_SLA = "eventsProducedOutsideAlternateSla";
   private static final String DROPPED_SENT_FROM_SERIALIZATION_ERROR = "droppedSentFromSerializationError";
   private static final String AGGREGATE = "aggregate";
   private static final String DEFAULT_AVAILABILITY_THRESHOLD_SLA_MS = "60000"; // 1 minute
   private static final String DEFAULT_AVAILABILITY_THRESHOLD_ALTERNATE_SLA_MS = "180000"; // 3 minutes
-  private static final long LATENCY_SLIDING_WINDOW_LENGTH_MS = Duration.ofMinutes(5).toMillis();
+  private static final String DEFAULT_WARN_LOG_LATENCY_ENABLED = "false";
+  private static final String DEFAULT_WARN_LOG_LATENCY_THRESHOLD_MS = "1500000000"; // 25000 minutes, ~17 days
+  private static final long LATENCY_SLIDING_WINDOW_LENGTH_MS = Duration.ofMinutes(3).toMillis();
   private static final long LONG_FLUSH_WARN_THRESHOLD_MS = Duration.ofMinutes(5).toMillis();
 
   private final DatastreamTask _datastreamTask;
@@ -82,6 +86,10 @@ public class EventProducer implements DatastreamEventProducer {
   private final int _availabilityThresholdSlaMs;
   // Alternate SLA for comparison with the main SLA
   private final int _availabilityThresholdAlternateSlaMs;
+  // Whether to enable warning logs if the latency threshold is met
+  private final boolean _warnLogLatencyEnabled;
+  // Latency threshold at which to log a warning message
+  private final long _warnLogLatencyThresholdMs;
   private final boolean _skipMessageOnSerializationErrors;
   private final boolean _enablePerTopicMetrics;
   private final Duration _flushInterval;
@@ -121,6 +129,12 @@ public class EventProducer implements DatastreamEventProducer {
     _availabilityThresholdAlternateSlaMs = Integer.parseInt(
         config.getProperty(AVAILABILITY_THRESHOLD_ALTERNATE_SLA_MS, DEFAULT_AVAILABILITY_THRESHOLD_ALTERNATE_SLA_MS));
 
+    _warnLogLatencyEnabled =
+        Boolean.parseBoolean(config.getProperty(WARN_LOG_LATENCY_ENABLED, DEFAULT_WARN_LOG_LATENCY_ENABLED));
+
+    _warnLogLatencyThresholdMs =
+        Long.parseLong(config.getProperty(WARN_LOG_LATENCY_THRESHOLD_MS, DEFAULT_WARN_LOG_LATENCY_THRESHOLD_MS));
+
     _flushInterval =
         Duration.ofMillis(Long.parseLong(config.getProperty(CONFIG_FLUSH_INTERVAL_MS, DEFAULT_FLUSH_INTERVAL_MS)));
 
@@ -133,7 +147,7 @@ public class EventProducer implements DatastreamEventProducer {
     // provision some metrics to force them to create
     _dynamicMetricsManager.createOrUpdateCounter(MODULE, AGGREGATE, EVENTS_PRODUCED_OUTSIDE_SLA, 0);
     if (!_enablePerTopicMetrics) {
-      _dynamicMetricsManager.createOrUpdateCounter(MODULE, _datastreamTask.getDatastreams().get(0).getName(), EVENTS_PRODUCED_OUTSIDE_SLA, 0);
+      _dynamicMetricsManager.createOrUpdateCounter(MODULE, getDatastreamName(), EVENTS_PRODUCED_OUTSIDE_SLA, 0);
     }
     _dynamicMetricsManager.createOrUpdateCounter(MODULE, _datastreamTask.getConnectorType(),
         EVENTS_PRODUCED_OUTSIDE_SLA, 0);
@@ -175,8 +189,10 @@ public class EventProducer implements DatastreamEventProducer {
         record.serializeEvents(_datastreamTask.getDestinationSerDes());
       } catch (Exception e) {
         if (_skipMessageOnSerializationErrors) {
-          _logger.info("Skipping the message on serialization error as configured.", e);
-          _dynamicMetricsManager.createOrUpdateCounter(MODULE, _datastreamTask.getDatastreams().get(0).getName(),
+          _logger.info(String.format("Skipping the message on serialization error as configured. "
+                  + "Datastream name: %s, Datastream task name: %s",
+              getDatastreamName(), _datastreamTask.getDatastreamTaskName()), e);
+          _dynamicMetricsManager.createOrUpdateCounter(MODULE, getDatastreamName(),
               DROPPED_SENT_FROM_SERIALIZATION_ERROR, 1);
           _dynamicMetricsManager.createOrUpdateCounter(MODULE, AGGREGATE, DROPPED_SENT_FROM_SERIALIZATION_ERROR, 1);
           return;
@@ -189,7 +205,8 @@ public class EventProducer implements DatastreamEventProducer {
           record.getDestination().orElse(_datastreamTask.getDatastreamDestination().getConnectionString());
       record.setEventsSendTimestamp(System.currentTimeMillis());
       _transportProvider.send(destination, record,
-          (metadata, exception) -> onSendCallback(metadata, exception, sendCallback, record));
+          (metadata, exception) -> onSendCallback(metadata, exception, sendCallback, record.getEventsSourceTimestamp(),
+              record.getEventsSendTimestamp().orElse(0L)));
     } catch (Exception e) {
       String errorMessage = String.format("Failed send the event %s exception %s", record, e);
       _logger.warn(errorMessage, e);
@@ -223,14 +240,14 @@ public class EventProducer implements DatastreamEventProducer {
    * per DatastreamProducerRecord (i.e. by the number of events within the record), only increment all metrics by 1
    * to avoid overcounting.
    */
-  private void reportMetrics(DatastreamRecordMetadata metadata, DatastreamProducerRecord record) {
+  private void reportMetrics(DatastreamRecordMetadata metadata, long eventsSourceTimestamp, long eventsSendTimestamp) {
     // If per-topic metrics are enabled, use topic as key for metrics; else, use datastream name as the key
-    String datastreamName = _datastreamTask.getDatastreams().get(0).getName();
+    String datastreamName = getDatastreamName();
     String topicOrDatastreamName = _enablePerTopicMetrics ? metadata.getTopic() : datastreamName;
     // Treat all events within this record equally (assume same timestamp)
-    if (record.getEventsSourceTimestamp() > 0) {
+    if (eventsSourceTimestamp > 0) {
       // Report availability metrics
-      long sourceToDestinationLatencyMs = System.currentTimeMillis() - record.getEventsSourceTimestamp();
+      long sourceToDestinationLatencyMs = System.currentTimeMillis() - eventsSourceTimestamp;
       // Using a time sliding window for reporting latency specifically.
       // Otherwise we report very stuck max value for slow source
       _dynamicMetricsManager.createOrUpdateSlidingWindowHistogram(MODULE, topicOrDatastreamName,
@@ -245,6 +262,11 @@ public class EventProducer implements DatastreamEventProducer {
 
       reportSLAMetrics(topicOrDatastreamName, sourceToDestinationLatencyMs <= _availabilityThresholdAlternateSlaMs,
           EVENTS_PRODUCED_WITHIN_ALTERNATE_SLA, EVENTS_PRODUCED_OUTSIDE_ALTERNATE_SLA);
+
+      if (_warnLogLatencyEnabled && (sourceToDestinationLatencyMs > _warnLogLatencyThresholdMs)) {
+        _logger.warn("Source to destination latency {} ms is higher than {} ms, Source Timestamp: {}, Metadata: {}",
+            sourceToDestinationLatencyMs, _warnLogLatencyThresholdMs, eventsSourceTimestamp, metadata.toString());
+      }
 
       if (_logger.isDebugEnabled()) {
         if (sourceToDestinationLatencyMs > _availabilityThresholdSlaMs) {
@@ -267,21 +289,20 @@ public class EventProducer implements DatastreamEventProducer {
     }
 
     // Report the time it took to just send the events to destination
-    record.getEventsSendTimestamp().ifPresent(sendTimestamp -> {
-      long sendLatency = System.currentTimeMillis() - sendTimestamp;
+    if (eventsSendTimestamp > 0) {
+      long sendLatency = System.currentTimeMillis() - eventsSendTimestamp;
       _dynamicMetricsManager.createOrUpdateHistogram(MODULE, topicOrDatastreamName, EVENTS_SEND_LATENCY_MS_STRING,
           sendLatency);
       _dynamicMetricsManager.createOrUpdateHistogram(MODULE, AGGREGATE, EVENTS_SEND_LATENCY_MS_STRING, sendLatency);
       _dynamicMetricsManager.createOrUpdateHistogram(MODULE, _datastreamTask.getConnectorType(),
           EVENTS_SEND_LATENCY_MS_STRING, sendLatency);
-    });
-
+    }
     _dynamicMetricsManager.createOrUpdateMeter(MODULE, AGGREGATE, EVENT_PRODUCE_RATE, 1);
     _dynamicMetricsManager.createOrUpdateMeter(MODULE, _datastreamTask.getConnectorType(), EVENT_PRODUCE_RATE, 1);
   }
 
   private void onSendCallback(DatastreamRecordMetadata metadata, Exception exception, SendCallback sendCallback,
-      DatastreamProducerRecord record) {
+      long eventSourceTimestamp, long eventSendTimestamp) {
 
     SendFailedException sendFailedException = null;
 
@@ -292,7 +313,7 @@ public class EventProducer implements DatastreamEventProducer {
     } else {
       // Report metrics
       checkpoint(metadata.getPartition(), metadata.getCheckpoint());
-      reportMetrics(metadata, record);
+      reportMetrics(metadata, eventSourceTimestamp, eventSendTimestamp);
     }
 
     // Inform the connector about the success or failure, In the case of failure,
@@ -367,6 +388,10 @@ public class EventProducer implements DatastreamEventProducer {
     return String.format("EventProducer producerId=%d", _producerId);
   }
 
+  private String getDatastreamName() {
+    return _datastreamTask.getDatastreams().get(0).getName();
+  }
+
   /**
    * Get the list of metrics maintained by the event producer
    */
@@ -379,6 +404,7 @@ public class EventProducer implements DatastreamEventProducer {
     metrics.add(new BrooklinMeterInfo(METRICS_PREFIX + EVENT_PRODUCE_RATE));
     metrics.add(new BrooklinCounterInfo(METRICS_PREFIX + EVENTS_PRODUCED_OUTSIDE_SLA));
     metrics.add(new BrooklinCounterInfo(METRICS_PREFIX + EVENTS_PRODUCED_OUTSIDE_ALTERNATE_SLA));
+    metrics.add(new BrooklinCounterInfo(METRICS_PREFIX + DROPPED_SENT_FROM_SERIALIZATION_ERROR));
     metrics.add(new BrooklinHistogramInfo(METRICS_PREFIX + EVENTS_LATENCY_MS_STRING, Optional.of(
         Arrays.asList(BrooklinHistogramInfo.MEAN, BrooklinHistogramInfo.MAX, BrooklinHistogramInfo.PERCENTILE_50,
             BrooklinHistogramInfo.PERCENTILE_99, BrooklinHistogramInfo.PERCENTILE_999))));

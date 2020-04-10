@@ -6,6 +6,7 @@
 package com.linkedin.datastream.connectors.kafka.mirrormaker;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -15,6 +16,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.TopicPartition;
@@ -24,6 +27,8 @@ import org.slf4j.LoggerFactory;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import kafka.admin.AdminUtils;
 
@@ -42,7 +47,10 @@ import com.linkedin.datastream.connectors.kafka.PausedSourcePartitionMetadata;
 import com.linkedin.datastream.connectors.kafka.TestKafkaConnectorUtils;
 import com.linkedin.datastream.kafka.KafkaTransportProviderAdmin;
 import com.linkedin.datastream.server.Coordinator;
+import com.linkedin.datastream.server.DatastreamGroup;
+import com.linkedin.datastream.server.DatastreamGroupPartitionsMetadata;
 import com.linkedin.datastream.server.DatastreamProducerRecord;
+import com.linkedin.datastream.server.DatastreamTask;
 import com.linkedin.datastream.server.DatastreamTaskImpl;
 import com.linkedin.datastream.server.FlushlessEventProducerHandler;
 import com.linkedin.datastream.server.SourceBasedDeduper;
@@ -54,6 +62,7 @@ import com.linkedin.datastream.testutil.DatastreamTestUtils;
 
 import static com.linkedin.datastream.connectors.kafka.mirrormaker.KafkaMirrorMakerConnectorTestUtils.POLL_PERIOD_MS;
 import static com.linkedin.datastream.connectors.kafka.mirrormaker.KafkaMirrorMakerConnectorTestUtils.POLL_TIMEOUT_MS;
+import static com.linkedin.datastream.connectors.kafka.mirrormaker.KafkaMirrorMakerConnectorTestUtils.getDefaultConfig;
 
 
 /**
@@ -544,7 +553,7 @@ public class TestKafkaMirrorMakerConnector extends BaseKafkaZkTest {
     String resultJson = connector.reduce(DATASTREAM_STATE_QUERY, responseMap);
     Map<String, String> reducedResults = JsonUtils.fromJson(resultJson, new TypeReference<HashMap<String, String>>() {
     });
-    Assert.assertTrue(reducedResults.keySet().size() == 2, "Should have received states from 2 instances");
+    Assert.assertEquals(reducedResults.keySet().size(), 2, "Should have received states from 2 instances");
 
     // Validate instance1 states response
     KafkaDatastreamStatesResponse response1 = KafkaDatastreamStatesResponse.fromJson(responseMap.get(instance1));
@@ -572,6 +581,155 @@ public class TestKafkaMirrorMakerConnector extends BaseKafkaZkTest {
     Assert.assertEquals(response2.getDatastream(), datastreamName,
         "Datastream name mismatch for instance");
 
+    connector.stop();
+  }
+
+  @Test
+  public void testFetchPartitionChange() throws Exception {
+    String clusterName = "testGroupIdAssignment";
+    Properties config = getDefaultConfig(Optional.empty());
+    config.put(AbstractKafkaConnector.IS_GROUP_ID_HASHING_ENABLED, Boolean.toString(true));
+    config.put(KafkaMirrorMakerConnector.PARTITION_FETCH_INTERVAL, "1000");
+    config.put(KafkaBasedConnectorConfig.ENABLE_PARTITION_ASSIGNMENT, Boolean.toString(true));
+
+
+    KafkaMirrorMakerConnector connector = new KafkaMirrorMakerConnector("MirrorMakerConnector", config, clusterName);
+
+    String yummyTopic = "YummyPizza";
+
+    createTopic(_zkUtils, yummyTopic, 1);
+
+    // create a datastream to consume from topics ending in "Pizza"
+    Datastream datastream = KafkaMirrorMakerConnectorTestUtils.createDatastream("pizzaStream", _broker, "\\w+Pizza");
+    DatastreamGroup group = new DatastreamGroup(ImmutableList.of(datastream));
+    List<DatastreamGroup> datastreamGroups1 = new ArrayList<>();
+    datastreamGroups1.add(group);
+
+    AtomicInteger partitionChangeCalls = new AtomicInteger(0);
+    connector.onPartitionChange(callbackGroup -> {
+      if (callbackGroup.equals(group)) {
+        partitionChangeCalls.incrementAndGet();
+      }
+    });
+
+    connector.start(null);
+
+    connector.handleDatastream(datastreamGroups1);
+    Assert.assertTrue(PollUtils.poll(() -> partitionChangeCalls.get() == 1, POLL_PERIOD_MS, POLL_TIMEOUT_MS));
+    Map<String, Optional<DatastreamGroupPartitionsMetadata>> partitionInfo = connector.getDatastreamPartitions();
+    Assert.assertEquals(partitionInfo.get(group.getTaskPrefix()).get().getDatastreamGroup().getName(),
+        group.getTaskPrefix());
+    Assert.assertEquals(new HashSet<>(partitionInfo.get(group.getTaskPrefix()).get().getPartitions()),
+        ImmutableSet.of(yummyTopic + "-0"));
+
+    String saltyTopic = "SaltyPizza";
+    createTopic(_zkUtils, saltyTopic, 2);
+
+    Assert.assertTrue(PollUtils.poll(() -> partitionChangeCalls.get() == 2, POLL_PERIOD_MS, POLL_TIMEOUT_MS));
+    partitionInfo = connector.getDatastreamPartitions();
+    Assert.assertEquals(new HashSet<>(partitionInfo.get(group.getTaskPrefix()).get().getPartitions()),
+        ImmutableSet.of(yummyTopic + "-0", saltyTopic + "-0", saltyTopic + "-1"));
+    connector.stop();
+  }
+
+  @Test
+  public void testDisableDatastreamChangeListener() throws Exception {
+    String clusterName = "testGroupIdAssignment";
+    Properties config = getDefaultConfig(Optional.empty());
+    config.put(KafkaBasedConnectorConfig.ENABLE_PARTITION_ASSIGNMENT, Boolean.toString(Boolean.FALSE));
+    config.put(AbstractKafkaConnector.IS_GROUP_ID_HASHING_ENABLED, Boolean.toString(true));
+    KafkaMirrorMakerConnector connector = new KafkaMirrorMakerConnector("MirrorMakerConnector", config, clusterName);
+    Datastream datastream1 =
+        KafkaMirrorMakerConnectorTestUtils.createDatastream("datastream1", _broker, "\\w+Event1");
+    List<DatastreamGroup> datastreamGroups1 = new ArrayList<>();
+    datastreamGroups1.add(new DatastreamGroup(ImmutableList.of(datastream1)));
+
+    //subscribe callback
+    connector.handleDatastream(datastreamGroups1);
+    Map<String, Optional<DatastreamGroupPartitionsMetadata>> partitionInfo = connector.getDatastreamPartitions();
+
+    Assert.assertEquals(partitionInfo.keySet(), Collections.EMPTY_SET);
+  }
+
+  @Test
+  public void testChangeDatatstreamAssignment() throws Exception {
+    String clusterName = "testGroupIdAssignment";
+    Properties config = getDefaultConfig(Optional.empty());
+    config.put(KafkaBasedConnectorConfig.ENABLE_PARTITION_ASSIGNMENT, Boolean.toString(true));
+    config.put(AbstractKafkaConnector.IS_GROUP_ID_HASHING_ENABLED, Boolean.toString(true));
+    KafkaMirrorMakerConnector connector = new KafkaMirrorMakerConnector("MirrorMakerConnector", config, clusterName);
+    Datastream datastream1 =
+        KafkaMirrorMakerConnectorTestUtils.createDatastream("datastream1", _broker, "\\w+Event1");
+    Datastream datastream2 =
+        KafkaMirrorMakerConnectorTestUtils.createDatastream("datastream2", _broker, "\\w+Event2");
+
+
+    List<DatastreamGroup> datastreamGroups1 = new ArrayList<>();
+    datastreamGroups1.add(new DatastreamGroup(ImmutableList.of(datastream1)));
+
+    //subscribe callback
+    connector.onPartitionChange(t -> { });
+
+    connector.handleDatastream(datastreamGroups1);
+
+    Map<String, Optional<DatastreamGroupPartitionsMetadata>> partitionInfo = connector.getDatastreamPartitions();
+    Assert.assertEquals(partitionInfo.keySet(),
+        datastreamGroups1.stream().map(DatastreamGroup::getTaskPrefix).collect(Collectors.toSet()));
+
+    // add datastream1
+    List<DatastreamGroup> datastreamGroups2 = new ArrayList<>();
+    datastreamGroups2.add(new DatastreamGroup(ImmutableList.of(datastream1)));
+    datastreamGroups2.add(new DatastreamGroup(ImmutableList.of(datastream2)));
+
+    connector.handleDatastream(datastreamGroups2);
+    partitionInfo = connector.getDatastreamPartitions();
+
+    Assert.assertEquals(partitionInfo.keySet(),
+        datastreamGroups2.stream().map(DatastreamGroup::getTaskPrefix).collect(Collectors.toSet()));
+
+    //remove datastream1
+    List<DatastreamGroup> datastreamGroups3 = new ArrayList<>();
+    datastreamGroups3.add(new DatastreamGroup(ImmutableList.of(datastream2)));
+
+    connector.handleDatastream(datastreamGroups3);
+    partitionInfo = connector.getDatastreamPartitions();
+
+    Assert.assertEquals(partitionInfo.keySet(),
+        datastreamGroups3.stream().map(DatastreamGroup::getTaskPrefix).collect(Collectors.toSet()));
+
+  }
+
+  @Test
+  public void testGetStateForMultipleTasks() throws Exception {
+    List<String> topics = Arrays.asList("YummyPizza", "SaltyPizza", "HealthySalad");
+    topics.forEach(t -> createTopic(_zkUtils, t));
+
+    // create a datastream to consume from topics ending in "Pizza"
+    Datastream datastream = KafkaMirrorMakerConnectorTestUtils.createDatastream("pizzaStream", _broker, "\\w+Pizza");
+
+    // create three tasks for this datastream
+    List<DatastreamTask> tasks = ImmutableList.of(new DatastreamTaskImpl(Collections.singletonList(datastream)),
+        new DatastreamTaskImpl(Collections.singletonList(datastream)),
+        new DatastreamTaskImpl(Collections.singletonList(datastream)));
+
+    MockDatastreamEventProducer datastreamProducer = new MockDatastreamEventProducer();
+    tasks.forEach(t -> ((DatastreamTaskImpl) t).setEventProducer(datastreamProducer));
+
+    KafkaMirrorMakerConnector connector =
+        new KafkaMirrorMakerConnector("MirrorMakerConnector", getDefaultConfig(Optional.empty()), "testCluster");
+    connector.start(null);
+
+    // notify connector of new task
+    connector.onAssignmentChange(tasks);
+
+    boolean hasExpectedTopicPartitions = PollUtils.poll(() -> {
+      String jsonStr = connector.process("/datastream_state?datastream=pizzaStream");
+      KafkaDatastreamStatesResponse response = KafkaDatastreamStatesResponse.fromJson(jsonStr);
+      return response.getAssignedTopicPartitions().equals(ImmutableSet.of(new TopicPartition("SaltyPizza", 0),
+          new TopicPartition("YummyPizza", 0)));
+    }, POLL_PERIOD_MS, POLL_TIMEOUT_MS);
+
+    Assert.assertTrue(hasExpectedTopicPartitions);
     connector.stop();
   }
 

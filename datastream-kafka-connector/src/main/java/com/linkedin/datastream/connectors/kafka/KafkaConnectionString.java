@@ -37,7 +37,7 @@ public class KafkaConnectionString {
    */
   public KafkaConnectionString(List<KafkaBrokerAddress> brokers, String topicName, boolean isSecure) {
     ArrayList<KafkaBrokerAddress> brokersCopy = new ArrayList<>(brokers);
-    Collections.sort(brokersCopy, KafkaBrokerAddress.BY_URL);
+    brokersCopy.sort(KafkaBrokerAddress.BY_URL);
     this._brokers = Collections.unmodifiableList(brokersCopy);
     this._topicName = topicName.trim();
     _isSecure = isSecure;
@@ -55,11 +55,18 @@ public class KafkaConnectionString {
     return _isSecure;
   }
 
-  @Override
-  public String toString() {
+  /**
+   * Returns a comma-separated list of the Kafka broker addresses.
+   */
+  public String getBrokerListString() {
     StringJoiner joiner = new StringJoiner(",");
     _brokers.forEach(kafkaBrokerAddress -> joiner.add(kafkaBrokerAddress.toString()));
-    return (_isSecure ? PREFIX_SCHEME_SECURE_KAFKA : PREFIX_SCHEME_KAFKA) + joiner.toString() + "/" + _topicName;
+    return joiner.toString();
+  }
+
+  @Override
+  public String toString() {
+    return (_isSecure ? PREFIX_SCHEME_SECURE_KAFKA : PREFIX_SCHEME_KAFKA) + getBrokerListString() + "/" + _topicName;
   }
 
   @Override
@@ -88,7 +95,7 @@ public class KafkaConnectionString {
    */
   public static KafkaConnectionString valueOf(String connectionString) throws IllegalArgumentException {
     if (connectionString == null) {
-      badArg(connectionString);
+      badArg(null);
     }
     String str = connectionString.trim();
     boolean isSecure = false;

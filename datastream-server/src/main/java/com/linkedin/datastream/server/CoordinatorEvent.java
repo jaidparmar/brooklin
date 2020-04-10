@@ -5,8 +5,13 @@
  */
 package com.linkedin.datastream.server;
 
+import java.util.Objects;
+
 /**
  * Represents different event types inside {@link Coordinator}.
+ *
+ * CoordinatorEvent will be deduped in the event queue {@link CoordinatorEventBlockingQueue}
+ * based on the event type. However, any event with eventMetadata will not get deduped
  */
 public class CoordinatorEvent {
 
@@ -15,15 +20,16 @@ public class CoordinatorEvent {
    */
   public enum EventType {
     LEADER_DO_ASSIGNMENT,
+    LEADER_PARTITION_ASSIGNMENT,
+    LEADER_PARTITION_MOVEMENT,
     HANDLE_ASSIGNMENT_CHANGE,
     HANDLE_DATASTREAM_CHANGE_WITH_UPDATE,
     HANDLE_ADD_OR_DELETE_DATASTREAM,
     HANDLE_INSTANCE_ERROR,
-    HEARTBEAT
+    HEARTBEAT,
+    NO_OP,
   }
 
-  public static final CoordinatorEvent LEADER_DO_ASSIGNMENT_EVENT =
-      new CoordinatorEvent(EventType.LEADER_DO_ASSIGNMENT);
   public static final CoordinatorEvent HANDLE_ASSIGNMENT_CHANGE_EVENT =
       new CoordinatorEvent(EventType.HANDLE_ASSIGNMENT_CHANGE);
   public static final CoordinatorEvent HANDLE_DATASTREAM_CHANGE_WITH_UPDATE_EVENT =
@@ -31,17 +37,34 @@ public class CoordinatorEvent {
   public static final CoordinatorEvent HANDLE_ADD_OR_DELETE_DATASTREAM_EVENT =
       new CoordinatorEvent(EventType.HANDLE_ADD_OR_DELETE_DATASTREAM);
   public static final CoordinatorEvent HEARTBEAT_EVENT = new CoordinatorEvent(EventType.HEARTBEAT);
+
+  // This event is used during shutdown to unblock an empty queue
+  public static final CoordinatorEvent NO_OP_EVENT = new CoordinatorEvent(EventType.NO_OP);
+
   protected final EventType _eventType;
+
+  // metadata can be used by for the event, it can be null.
+  // The event with metadata will not get deduped
+  protected final Object _eventMetadata;
 
   private CoordinatorEvent(EventType eventType) {
     _eventType = eventType;
+    _eventMetadata = null;
+  }
+
+  private CoordinatorEvent(EventType eventType, Object eventMetadata) {
+    _eventType = eventType;
+    _eventMetadata = eventMetadata;
   }
 
   /**
    * Returns an event that indicates a new assignment needs to be done (this is a leader-specific event).
+   * cleanUpOrphanConnectorTasks should be set to true once when the coordinator becomes leader.
+   * If this is set to true, coordinator will check if there are any orphan connector tasks that have no
+   * binding with any live instance, and will verify/clean those nodes from zookeeper.
    */
-  public static CoordinatorEvent createLeaderDoAssignmentEvent() {
-    return LEADER_DO_ASSIGNMENT_EVENT;
+  public static CoordinatorEvent createLeaderDoAssignmentEvent(boolean cleanUpOrphanConnectorTasks) {
+    return new CoordinatorEvent(EventType.LEADER_DO_ASSIGNMENT, cleanUpOrphanConnectorTasks);
   }
 
   /**
@@ -59,6 +82,23 @@ public class CoordinatorEvent {
   }
 
   /**
+   * Return an event that indicates that partition need to be assigned for a datastream group
+   * @param datastreamGroupName the name of datastream group which receives partition changes
+   * @return
+   */
+  public static CoordinatorEvent createLeaderPartitionAssignmentEvent(String datastreamGroupName) {
+    return new CoordinatorEvent(EventType.LEADER_PARTITION_ASSIGNMENT, datastreamGroupName);
+  }
+
+  /**
+   * Return an event that indicates a partition movement has been received
+   * @param notifyTimestamp the timestamp that partition movement is triggered
+   */
+  public static CoordinatorEvent createPartitionMovementEvent(Long notifyTimestamp) {
+    return new CoordinatorEvent(EventType.LEADER_PARTITION_MOVEMENT, notifyTimestamp);
+  }
+
+  /**
    * Returns an event that indicates addition/deletion of new/existing datastream.
    */
   public static CoordinatorEvent createHandleDatastreamAddOrDeleteEvent() {
@@ -73,6 +113,10 @@ public class CoordinatorEvent {
     return new HandleInstanceError(errorMessage);
   }
 
+  public Object getEventMetadata() {
+    return _eventMetadata;
+  }
+
   public EventType getType() {
     return _eventType;
   }
@@ -80,6 +124,23 @@ public class CoordinatorEvent {
   @Override
   public String toString() {
     return "type:" + _eventType;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    CoordinatorEvent that = (CoordinatorEvent) o;
+    return _eventType == that._eventType && Objects.equals(_eventMetadata, that._eventMetadata);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(_eventType, _eventMetadata);
   }
 
   /**
@@ -95,6 +156,26 @@ public class CoordinatorEvent {
 
     public String getEventData() {
       return _errorMessage;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      if (!super.equals(o)) {
+        return false;
+      }
+      HandleInstanceError that = (HandleInstanceError) o;
+      return Objects.equals(_errorMessage, that._errorMessage);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(super.hashCode(), _errorMessage);
     }
 
     @Override

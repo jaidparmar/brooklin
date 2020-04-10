@@ -27,8 +27,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.codahale.metrics.CsvReporter;
-import com.codahale.metrics.JmxReporter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.jmx.JmxReporter;
 
 import com.linkedin.datastream.common.DatastreamException;
 import com.linkedin.datastream.common.DatastreamRuntimeException;
@@ -39,6 +39,7 @@ import com.linkedin.datastream.common.VerifiableProperties;
 import com.linkedin.datastream.common.zk.ZkClient;
 import com.linkedin.datastream.metrics.BrooklinMetricInfo;
 import com.linkedin.datastream.metrics.DynamicMetricsManager;
+import com.linkedin.datastream.metrics.JmxReporterFactory;
 import com.linkedin.datastream.server.api.connector.Connector;
 import com.linkedin.datastream.server.api.connector.ConnectorFactory;
 import com.linkedin.datastream.server.api.connector.DatastreamDeduper;
@@ -148,7 +149,6 @@ public class DatastreamServer {
     }
 
     CoordinatorConfig coordinatorConfig = new CoordinatorConfig(properties);
-    coordinatorConfig.setAssignmentChangeThreadPoolThreadCount(connectorTypes.size());
 
     LOG.info("Setting up DMS endpoint server.");
     ZkClient zkClient = new ZkClient(coordinatorConfig.getZkAddress(), coordinatorConfig.getZkSessionTimeout(),
@@ -191,7 +191,7 @@ public class DatastreamServer {
 
     Properties diagProperties = verifiableProperties.getDomainProperties(DOMAIN_DIAG);
     String diagPortStr = diagProperties.getProperty(CONFIG_DIAG_PORT, "");
-    int diagPort = diagPortStr.isEmpty() ? _httpPort : Integer.valueOf(diagPortStr);
+    int diagPort = diagPortStr.isEmpty() ? _httpPort : Integer.parseInt(diagPortStr);
     String diagPath = diagProperties.getProperty(CONFIG_DIAG_PATH, "");
     _serverComponentHealthAggregator = new ServerComponentHealthAggregator(zkClient, coordinatorConfig.getCluster(), diagPort, diagPath);
 
@@ -336,9 +336,10 @@ public class DatastreamServer {
     boolean customCheckpointing =
         Boolean.parseBoolean(connectorProperties.getProperty(CONFIG_CONNECTOR_CUSTOM_CHECKPOINTING, "false"));
 
+
     String authorizerName = connectorProps.getString(CONFIG_CONNECTOR_AUTHORIZER_NAME, null);
-    _coordinator.addConnector(connectorName, connectorInstance, assignmentStrategy, customCheckpointing,
-        deduper, authorizerName);
+    _coordinator.addConnector(connectorName, connectorInstance, assignmentStrategy, customCheckpointing, deduper,
+        authorizerName);
 
     LOG.info("Connector loaded successfully. Type: " + connectorName);
   }
@@ -348,14 +349,16 @@ public class DatastreamServer {
     METRIC_INFOS.addAll(_coordinator.getMetricInfos());
     METRIC_INFOS.addAll(DatastreamResources.getMetricInfos());
 
-    _jmxReporter = JmxReporter.forRegistry(METRIC_REGISTRY).build();
+    _jmxReporter = JmxReporterFactory.createJmxReporter(METRIC_REGISTRY);
 
     if (StringUtils.isNotEmpty(_csvMetricsDir)) {
       LOG.info("Starting CsvReporter in " + _csvMetricsDir);
       File csvDir = new File(_csvMetricsDir);
       if (!csvDir.exists()) {
         LOG.info("csvMetricsDir {} doesn't exist, creating it.", _csvMetricsDir);
-        csvDir.mkdirs();
+        if (!csvDir.mkdirs()) {
+          LOG.warn("failed to created csvMetricsDir");
+        }
       }
 
       final CsvReporter reporter = CsvReporter.forRegistry(METRIC_REGISTRY)
@@ -433,15 +436,12 @@ public class DatastreamServer {
     ReentrantLock lock = new ReentrantLock();
     Condition shutdownCondition = lock.newCondition();
     // attach shutdown handler to catch control-c
-    Runtime.getRuntime().addShutdownHook(new Thread() {
-      @Override
-      public void run() {
-        lock.lock();
-        LOG.info("Starting the shutdown process..");
-        server.shutdown();
-        shutdownCondition.signalAll();
-      }
-    });
+    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+      lock.lock();
+      LOG.info("Starting the shutdown process..");
+      server.shutdown();
+      shutdownCondition.signalAll();
+    }));
 
     lock.lock();
     server.startup();

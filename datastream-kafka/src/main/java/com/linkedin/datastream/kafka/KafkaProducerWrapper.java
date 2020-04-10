@@ -24,6 +24,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,8 +55,8 @@ class KafkaProducerWrapper<K, V> {
   @VisibleForTesting
   static final String PRODUCER_COUNT = "producerCount";
 
-  private static AtomicInteger _producerCount = new AtomicInteger();
-  private static final Supplier<Integer> PRODUCER_GAUGE = () -> _producerCount.get();
+  private static final AtomicInteger NUM_PRODUCERS = new AtomicInteger();
+  private static final Supplier<Integer> PRODUCER_GAUGE = NUM_PRODUCERS::get;
 
   private static final int TIME_OUT = 2000;
   private static final int MAX_SEND_ATTEMPTS = 10;
@@ -66,7 +67,7 @@ class KafkaProducerWrapper<K, V> {
   private final Properties _props;
 
   // Set of datastream tasks assigned to the producer
-  private Set<DatastreamTask> _tasks = ConcurrentHashMap.newKeySet();
+  private final Set<DatastreamTask> _tasks = ConcurrentHashMap.newKeySet();
 
   // Producer is lazily initialized during the first send call.
   // Also, can be nullified in case of exceptions, and recreated by subsequent send calls.
@@ -173,11 +174,16 @@ class KafkaProducerWrapper<K, V> {
     } else {
       if (_kafkaProducer == null) {
         _rateLimiter.acquire();
-        _kafkaProducer = _producerFactory.createProducer(_props);
-        _producerCount.incrementAndGet();
+        _kafkaProducer = createKafkaProducer();
+        NUM_PRODUCERS.incrementAndGet();
       }
     }
     return _kafkaProducer;
+  }
+
+  @VisibleForTesting
+  Producer<K, V> createKafkaProducer() {
+    return _producerFactory.createProducer(_props);
   }
 
   void send(DatastreamTask task, ProducerRecord<K, V> producerRecord, Callback onComplete)
@@ -210,11 +216,11 @@ class KafkaProducerWrapper<K, V> {
         Thread.sleep(_sendFailureRetryWaitTimeMs);
       } catch (KafkaException e) {
         Throwable cause = e.getCause();
-        while (cause != null && cause instanceof KafkaException) {
+        while (cause instanceof KafkaException) {
           cause = cause.getCause();
         }
         // Set a max_send_attempts for KafkaException as it may be non-recoverable
-        if (numberOfAttempt > MAX_SEND_ATTEMPTS || (cause != null && (cause instanceof Error || cause instanceof RuntimeException))) {
+        if (numberOfAttempt > MAX_SEND_ATTEMPTS || ((cause instanceof Error || cause instanceof RuntimeException))) {
           _log.error("Send failed for partition {} with a non retriable exception", producerRecord.partition(), e);
           throw generateSendFailure(e);
         } else {
@@ -236,7 +242,7 @@ class KafkaProducerWrapper<K, V> {
     _kafkaProducer = null;
     if (producer != null) {
       producer.close(TIME_OUT, TimeUnit.MILLISECONDS);
-      _producerCount.decrementAndGet();
+      NUM_PRODUCERS.decrementAndGet();
     }
   }
 
@@ -254,7 +260,14 @@ class KafkaProducerWrapper<K, V> {
 
   synchronized void flush() {
     if (_kafkaProducer != null) {
-      _kafkaProducer.flush();
+      try {
+        _kafkaProducer.flush();
+      } catch (InterruptException e) {
+        // The KafkaProducer object should not be reused on an interrupted flush
+        _log.warn("Kafka producer flush interrupted, closing producer {}.", _kafkaProducer);
+        shutdownProducer();
+        throw e;
+      }
     }
   }
 

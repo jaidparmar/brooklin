@@ -26,7 +26,7 @@ import com.linkedin.datastream.server.providers.CheckpointProvider;
  *  When the Coordinator starts, it will start all connectors it manages by calling the <i>start</i> method. When the
  *  Coordinator is shutting down gracefully, it will stop all connectors by calling the <i>stop</i> method.
  */
-public interface Connector extends MetricsAware {
+public interface Connector extends MetricsAware, DatastreamChangeListener {
   /**
    * Method to start the connector.
    * This is called immediately after the connector is instantiated. This typically happens when brooklin server starts up.
@@ -85,6 +85,20 @@ public interface Connector extends MetricsAware {
    * @param updateType Type of datastream update
    */
   default boolean isDatastreamUpdateTypeSupported(Datastream datastream, DatastreamConstants.UpdateType updateType) {
+    return false;
+  }
+
+  /**
+   * Returns whether Brooklin should manage partition assignment
+   *
+   * Brooklin allows the partitions to be managed and assigned by the upstream source (ex. Kafka) or
+   * Brooklin itself. This tells if Brooklin should manage the partition for this connector
+   *
+   * @return
+   *  true if the connector relies on Brooklin to manage partitions
+   *  false if this connector relies on the source (ex. Kafka) to manage and assign partitions
+   */
+  default boolean isPartitionManagementSupported() {
     return false;
   }
 

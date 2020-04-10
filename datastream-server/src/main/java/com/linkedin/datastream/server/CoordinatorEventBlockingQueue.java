@@ -5,9 +5,9 @@
  */
 package com.linkedin.datastream.server;
 
-import java.util.EnumMap;
-import java.util.Map;
+import java.util.HashSet;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.slf4j.Logger;
@@ -21,34 +21,32 @@ import org.slf4j.LoggerFactory;
 public class CoordinatorEventBlockingQueue {
 
   private static final Logger LOG = LoggerFactory.getLogger(CoordinatorEventBlockingQueue.class.getName());
-  private final Map<CoordinatorEvent.EventType, CoordinatorEvent> _eventMap;
+  private final Set<CoordinatorEvent> _eventSet;
   private final Queue<CoordinatorEvent> _eventQueue;
 
   /**
    * Construct a blocking event queue for all types of events in {@link CoordinatorEvent.EventType}
    */
   public CoordinatorEventBlockingQueue() {
-    _eventMap = new EnumMap<>(CoordinatorEvent.EventType.class);
+    _eventSet = new HashSet<>();
     _eventQueue = new LinkedBlockingQueue<>();
   }
 
   /**
-   * Add a single event to the queue, overwriting events with the same name
+   * Add a single event to the queue, overwriting events with the same name and same metadata.
    * @param event CoordinatorEvent event to add to the queue
    */
   public synchronized void put(CoordinatorEvent event) {
     LOG.info("Queuing event {} to event queue", event.getType());
-    if (!_eventMap.containsKey(event.getType())) {
-      // only insert if there isn't an event present in the queue with the same name
+    if (!_eventSet.contains(event)) {
+      // only insert if there isn't an event present in the queue with the same name and same metadata.
       boolean result = _eventQueue.offer(event);
       if (!result) {
         return;
       }
+      _eventSet.add(event);
     }
-
-    // always overwrite the event in the map
-    _eventMap.put(event.getType(), event);
-    LOG.debug("Event queue size %d", _eventQueue.size());
+    LOG.debug("Event queue size {}", _eventQueue.size());
     notify();
   }
 
@@ -68,13 +66,17 @@ public class CoordinatorEventBlockingQueue {
 
     CoordinatorEvent queuedEvent = _eventQueue.poll();
 
-    if (queuedEvent != null) {
-      LOG.info("De-queuing event " + queuedEvent.getType());
-      LOG.debug("Event queue size: %d", _eventQueue.size());
-      return _eventMap.remove(queuedEvent.getType());
+    if (CoordinatorEvent.NO_OP_EVENT == queuedEvent) {
+      return null;
     }
 
-    return null;
+    if (queuedEvent != null) {
+      LOG.info("De-queuing event " + queuedEvent.getType());
+      LOG.debug("Event queue size: {}", _eventQueue.size());
+      _eventSet.remove(queuedEvent);
+    }
+
+    return queuedEvent;
   }
 
   /**
@@ -84,11 +86,7 @@ public class CoordinatorEventBlockingQueue {
    * @return the head of this queue, or {@code null} if this queue is empty
    */
   public synchronized CoordinatorEvent peek() {
-    CoordinatorEvent queuedEvent = _eventQueue.peek();
-    if (queuedEvent != null) {
-      return _eventMap.get(queuedEvent.getType());
-    }
-    return null;
+    return _eventQueue.peek();
   }
 
   /**

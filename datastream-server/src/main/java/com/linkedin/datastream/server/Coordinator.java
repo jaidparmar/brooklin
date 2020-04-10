@@ -19,11 +19,10 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,6 +38,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.codahale.metrics.MetricRegistry;
+import com.google.common.annotations.VisibleForTesting;
 
 import com.linkedin.datastream.common.Datastream;
 import com.linkedin.datastream.common.DatastreamAlreadyExistsException;
@@ -47,6 +47,7 @@ import com.linkedin.datastream.common.DatastreamDestination;
 import com.linkedin.datastream.common.DatastreamException;
 import com.linkedin.datastream.common.DatastreamMetadataConstants;
 import com.linkedin.datastream.common.DatastreamStatus;
+import com.linkedin.datastream.common.DatastreamTransientException;
 import com.linkedin.datastream.common.DatastreamUtils;
 import com.linkedin.datastream.common.ErrorLogger;
 import com.linkedin.datastream.common.VerifiableProperties;
@@ -152,21 +153,29 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   private static final String EVENT_PRODUCER_CONFIG_DOMAIN = "brooklin.server.eventProducer";
 
   private static final String MODULE = Coordinator.class.getSimpleName();
-  private static final long EVENT_THREAD_JOIN_TIMEOUT = 1000L;
+  private static final long EVENT_THREAD_LONG_JOIN_TIMEOUT = 30000L;
+  private static final long EVENT_THREAD_SHORT_JOIN_TIMEOUT = 3000L;
+
   private static final Duration ASSIGNMENT_TIMEOUT = Duration.ofSeconds(30);
   private static final String NUM_REBALANCES = "numRebalances";
   private static final String NUM_ERRORS = "numErrors";
   private static final String NUM_RETRIES = "numRetries";
   private static final String NUM_HEARTBEATS = "numHeartbeats";
   private static final String NUM_ASSIGNMENT_CHANGES = "numAssignmentChanges";
-  private static final String IS_LEADER = "isLeader";
+  private static final String NUM_PARTITION_ASSIGNMENTS = "numPartitionAssignments";
+  private static final String NUM_PARTITION_MOVEMENTS = "numPartitionMovements";
   private static final String NUM_PAUSED_DATASTREAMS_GROUPS = "numPausedDatastreamsGroups";
+  private static final String NUM_ORPHAN_CONNECTOR_TASKS = "numOrphanConnectorTasks";
+  private static final String MAX_PARTITION_COUNT_IN_TASK = "maxPartitionCountInTask";
+  private static final String IS_LEADER = "isLeader";
 
   // Connector common metrics
   private static final String NUM_DATASTREAMS = "numDatastreams";
   private static final String NUM_DATASTREAM_TASKS = "numDatastreamTasks";
 
-  private static AtomicLong _pausedDatastreamsGroups = new AtomicLong(0L);
+  private static final AtomicLong PAUSED_DATASTREAMS_GROUPS = new AtomicLong(0L);
+
+  private static final AtomicLong MAX_PARTITION_COUNT = new AtomicLong(0L);
 
   private final CachedDatastreamReader _datastreamCache;
   private final Properties _eventProducerConfig;
@@ -174,7 +183,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   private final Map<String, TransportProviderAdmin> _transportProviderAdmins = new HashMap<>();
   private final CoordinatorEventBlockingQueue _eventQueue;
   private final CoordinatorEventProcessor _eventThread;
-  private final ThreadPoolExecutor _assignmentChangeThreadPool;
+  private final Map<String, ExecutorService> _assignmentChangeThreadPool = new ConcurrentHashMap<>();
   private final String _clusterName;
   private final CoordinatorConfig _config;
   private final ZkAdapter _adapter;
@@ -204,7 +213,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
   private final Map<String, SerdeAdmin> _serdeAdmins = new HashMap<>();
   private final Map<String, Authorizer> _authorizers = new HashMap<>();
-
+  private volatile boolean _shutdown = false;
   /**
    * Constructor for coordinator
    * @param datastreamCache Cache to maintain all the datastreams in the cluster.
@@ -226,20 +235,16 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     _clusterName = _config.getCluster();
     _heartbeatPeriod = Duration.ofMillis(config.getHeartbeatPeriodMs());
 
-    _adapter = new ZkAdapter(_config.getZkAddress(), _clusterName, _config.getDefaultTransportProviderName(),
-        _config.getZkSessionTimeout(), _config.getZkConnectionTimeout(), this);
+    _adapter = createZkAdapter();
 
     _eventQueue = new CoordinatorEventBlockingQueue();
     _eventThread = new CoordinatorEventProcessor();
     _eventThread.setDaemon(true);
 
     _dynamicMetricsManager = DynamicMetricsManager.getInstance();
-    _dynamicMetricsManager.registerGauge(MODULE, NUM_PAUSED_DATASTREAMS_GROUPS, () -> _pausedDatastreamsGroups.get());
+    _dynamicMetricsManager.registerGauge(MODULE, NUM_PAUSED_DATASTREAMS_GROUPS, PAUSED_DATASTREAMS_GROUPS::get);
     _dynamicMetricsManager.registerGauge(MODULE, IS_LEADER, () -> getIsLeader().getAsBoolean() ? 1 : 0);
-
-    // Creating a separate thread pool for making the onAssignmentChange calls to the connector
-    _assignmentChangeThreadPool = new ThreadPoolExecutor(config.getAssignmentChangeThreadPoolThreadCount(),
-        config.getAssignmentChangeThreadPoolThreadCount(), 10, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+    _dynamicMetricsManager.registerGauge(MODULE, MAX_PARTITION_COUNT_IN_TASK, MAX_PARTITION_COUNT::get);
 
     VerifiableProperties coordinatorProperties = new VerifiableProperties(_config.getConfigProperties());
 
@@ -249,6 +254,12 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     Optional.ofNullable(_cpProvider.getMetricInfos()).ifPresent(_metrics::addAll);
 
     _metrics.addAll(EventProducer.getMetricInfos());
+  }
+
+  @VisibleForTesting
+  ZkAdapter createZkAdapter() {
+    return new ZkAdapter(_config.getZkAddress(), _clusterName, _config.getDefaultTransportProviderName(),
+        _config.getZkSessionTimeout(), _config.getZkConnectionTimeout(), this);
   }
 
   /**
@@ -263,12 +274,15 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       ConnectorInfo connectorInfo = _connectors.get(connectorType);
       ConnectorWrapper connector = connectorInfo.getConnector();
 
+      // Creating a separate thread pool for making the onAssignmentChange calls to the connector
+      _assignmentChangeThreadPool.put(connectorType, Executors.newSingleThreadExecutor());
+
       // populate the instanceName. We only know the instance name after _adapter.connect()
       connector.setInstanceName(getInstanceName());
 
       // make sure connector znode exists upon instance start. This way in a brand new cluster
       // we can inspect ZooKeeper and know what connectors are created
-      _adapter.ensureConnectorZNode(connector.getConnectorType());
+      _adapter.addConnectorType(connector.getConnectorType());
 
       // call connector::start API
       connector.start(connectorInfo.getCheckpointProvider());
@@ -291,13 +305,27 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   public void stop() {
     _log.info("Stopping coordinator");
 
-    // Stopping event threads so that no more events are scheduled for the connector.
+    _shutdown = true;
+
+    // queue a NO_OP event to unblock eventThread if it is waiting on the queue
+    _eventQueue.put(CoordinatorEvent.NO_OP_EVENT);
+
+    // wait for eventThread to gracefully finish
+    try {
+      _eventThread.join(EVENT_THREAD_LONG_JOIN_TIMEOUT);
+    } catch (InterruptedException e) {
+      _log.warn("Exception caught while waiting event thread to stop", e);
+      return;
+    }
+
+    // interrupt the thread if it's not gracefully shutdown
     while (_eventThread.isAlive()) {
       try {
         _eventThread.interrupt();
-        _eventThread.join(EVENT_THREAD_JOIN_TIMEOUT);
+        _eventThread.join(EVENT_THREAD_SHORT_JOIN_TIMEOUT);
       } catch (InterruptedException e) {
         _log.warn("Exception caught while stopping coordinator", e);
+        return;
       }
     }
 
@@ -316,7 +344,6 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     for (DatastreamTask task : _assignedDatastreamTasks.values()) {
       ((EventProducer) task.getEventProducer()).shutdown();
     }
-
     _adapter.disconnect();
     _log.info("Coordinator stopped");
   }
@@ -348,7 +375,9 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     // when an instance becomes a leader, make sure we don't miss new datastreams and
     // new assignment tasks that was not finished by the previous leader
     _eventQueue.put(CoordinatorEvent.createHandleDatastreamAddOrDeleteEvent());
-    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent());
+    // verify/cleanup the orphan task nodes under connector should be called only once after becoming leader,
+    // since it is an expensive operation. So, passing cleanUpOrphanNodes = true only on onBecomeLeader.
+    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(true));
     _log.info("Coordinator::onBecomeLeader completed successfully");
   }
 
@@ -359,7 +388,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   @Override
   public void onLiveInstancesChange() {
     _log.info("Coordinator::onLiveInstancesChange is called");
-    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent());
+    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(false));
     _log.info("Coordinator::onLiveInstancesChange completed successfully");
   }
 
@@ -372,7 +401,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     _log.info("Coordinator::onDatastreamAddOrDrop is called");
     // if there are new datastreams created, we need to trigger the topic creation logic
     _eventQueue.put(CoordinatorEvent.createHandleDatastreamAddOrDeleteEvent());
-    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent());
+    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(false));
     _log.info("Coordinator::onDatastreamAddOrDrop completed successfully");
   }
 
@@ -402,6 +431,15 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     _log.info("Coordinator::onDatastreamUpdate completed successfully");
   }
 
+  /**
+   * onPartitionMovement is called when partition movement info has been put into zookeeper
+   */
+  @Override
+  public void onPartitionMovement(Long notifyTimestamp) {
+    _log.info("Coordinator::onPartitionMovement is called");
+    _eventQueue.put(CoordinatorEvent.createPartitionMovementEvent(notifyTimestamp));
+    _log.info("Coordinator::onPartitionMovement completed successfully");
+  }
   /**
    * {@inheritDoc}
    *
@@ -560,7 +598,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       addedTasks.stream().filter(t -> t.getEventProducer() == null).forEach(this::initializeTask);
 
       // Dispatch the onAssignmentChange to the connector in a separate thread.
-      return _assignmentChangeThreadPool.submit(() -> {
+      return _assignmentChangeThreadPool.get(connectorType).submit(() -> {
         try {
           connector.onAssignmentChange(assignment);
           // Unassign tasks with producers
@@ -593,7 +631,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     DatastreamTaskImpl taskImpl = (DatastreamTaskImpl) task;
     assignSerdes(taskImpl);
 
-    boolean customCheckpointing = _connectors.get(task.getConnectorType()).isCustomCheckpointing();
+    boolean customCheckpointing = getCustomCheckpointing(task);
     TransportProviderAdmin tpAdmin = _transportProviderAdmins.get(task.getTransportProviderName());
     TransportProvider transportProvider = tpAdmin.assignTransportProvider(task);
     EventProducer producer =
@@ -602,6 +640,21 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     taskImpl.setEventProducer(producer);
     Map<Integer, String> checkpoints = producer.loadCheckpoints(task);
     taskImpl.setCheckpoints(checkpoints);
+  }
+
+  private boolean getCustomCheckpointing(DatastreamTask task) {
+    boolean customCheckpointing = _connectors.get(task.getConnectorType()).isCustomCheckpointing();
+
+    Datastream datastream = task.getDatastreams().get(0);
+    if (datastream.hasMetadata()
+        && datastream.getMetadata().containsKey(DatastreamMetadataConstants.CUSTOM_CHECKPOINT)) {
+      customCheckpointing = Boolean.valueOf(
+          datastream.getMetadata().get(DatastreamMetadataConstants.CUSTOM_CHECKPOINT));
+      _log.info(String.format("Custom checkpointing overridden by metadata to be: %b for datastream: %s",
+          customCheckpointing, datastream));
+    }
+
+    return customCheckpointing;
   }
 
   private void assignSerdes(DatastreamTaskImpl datastreamTask) {
@@ -637,7 +690,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     try {
       switch (event.getType()) {
         case LEADER_DO_ASSIGNMENT:
-          handleLeaderDoAssignment();
+          handleLeaderDoAssignment((Boolean) event.getEventMetadata());
           break;
 
         case HANDLE_ASSIGNMENT_CHANGE:
@@ -664,6 +717,18 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
         case HEARTBEAT:
           handleHeartbeat();
+          break;
+
+        case LEADER_PARTITION_ASSIGNMENT:
+          if (event.getEventMetadata() == null) {
+            _log.error("Datastream group is not found when performing partition assignment, ignore the assignment");
+          } else {
+            performPartitionAssignment((String) event.getEventMetadata());
+          }
+          break;
+
+        case LEADER_PARTITION_MOVEMENT:
+          performPartitionMovement((Long) event.getEventMetadata());
           break;
 
         default:
@@ -790,7 +855,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       }
     }
 
-    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent());
+    _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(false));
   }
 
   private void hardDeleteDatastream(Datastream ds, List<Datastream> allStreams) {
@@ -810,7 +875,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       _log.info(
           "No datastream left in the datastream group with taskPrefix {}. Deleting all tasks corresponding to the datastream.",
           taskPrefix);
-      _adapter.deleteTasksWithPrefix(_connectors.keySet(), taskPrefix);
+      _adapter.deleteTasksWithPrefix(ds.getConnectorName(), taskPrefix);
       deleteTopic(ds);
     } else {
       _log.info("Found duplicate datastream {} for the datastream to be deleted {}. Not deleting the tasks.",
@@ -890,7 +955,11 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
         .collect(Collectors.toList());
   }
 
-  private void handleLeaderDoAssignment() {
+  /*
+   * If cleanUpOrphanConnectorTasks is set to true, it cleans up the orphan connector tasks not assigned to
+   * any instance after old unused tasks are cleaned up.
+   */
+  private void handleLeaderDoAssignment(boolean cleanUpOrphanConnectorTasks) {
     boolean succeeded = true;
     List<String> liveInstances = Collections.emptyList();
     Map<String, Set<DatastreamTask>> previousAssignmentByInstance = Collections.emptyMap();
@@ -898,6 +967,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
     try {
       List<DatastreamGroup> datastreamGroups = fetchDatastreamGroups();
+
+      onDatastreamChange(datastreamGroups);
 
       _log.debug("handleLeaderDoAssignment: final datastreams for task assignment: {}", datastreamGroups);
 
@@ -929,6 +1000,9 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       instances.add(PAUSED_INSTANCE);
       _adapter.cleanupDeadInstanceAssignments(instances);
       _adapter.cleanupOldUnusedTasks(previousAssignmentByInstance, newAssignmentsByInstance);
+      if (cleanUpOrphanConnectorTasks) {
+        performCleanupOrphanConnectorTasks();
+      }
       _dynamicMetricsManager.createOrUpdateMeter(MODULE, NUM_REBALANCES, 1);
     }
 
@@ -938,8 +1012,198 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       _dynamicMetricsManager.createOrUpdateMeter(MODULE, "handleLeaderDoAssignment", NUM_RETRIES, 1);
       leaderDoAssignmentScheduled.set(true);
       _executor.schedule(() -> {
-        _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent());
+        _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(cleanUpOrphanConnectorTasks));
         leaderDoAssignmentScheduled.set(false);
+      }, _config.getRetryIntervalMs(), TimeUnit.MILLISECONDS);
+    }
+  }
+
+  /**
+   * assign the partition to tasks for a particular datastreamGroup
+   *
+   * @param datastreamGroupName the datastreamGroup that needs to perform the partition assignment
+   */
+  private void performPartitionAssignment(String datastreamGroupName) {
+    boolean succeeded = false;
+    Map<String, Set<DatastreamTask>> previousAssignmentByInstance = new HashMap<>();
+    Map<String, List<DatastreamTask>> newAssignmentsByInstance = new HashMap<>();
+
+    try {
+      previousAssignmentByInstance = _adapter.getAllAssignedDatastreamTasks();
+      Map<String, Set<DatastreamTask>> assignmentByInstance = new HashMap<>(previousAssignmentByInstance);
+
+      // retrieve the datastreamGroups for validation
+      DatastreamGroup toProcessDatastream =
+          fetchDatastreamGroups().stream().filter(dg -> datastreamGroupName.equals(dg.getName())).findFirst().orElse(null);
+
+      if (toProcessDatastream != null) {
+        AssignmentStrategy strategy = _connectors.get(toProcessDatastream.getConnectorName()).getAssignmentStrategy();
+        Connector connectorInstance = _connectors.get(toProcessDatastream.getConnectorName()).getConnector()
+            .getConnectorInstance();
+        Map<String, Optional<DatastreamGroupPartitionsMetadata>> datastreamPartitions =
+            connectorInstance.getDatastreamPartitions();
+
+        if (datastreamPartitions.containsKey(toProcessDatastream.getName())) {
+          DatastreamGroupPartitionsMetadata subscribes = connectorInstance.getDatastreamPartitions()
+              .get(toProcessDatastream.getName())
+              .orElseThrow(() ->
+                  new DatastreamTransientException("Subscribed partition is not ready yet for datastream " +
+                      toProcessDatastream.getName()));
+
+          assignmentByInstance = strategy.assignPartitions(assignmentByInstance, subscribes);
+        } else {
+          // The datastream group will not found only when the datastream was just paused/removed but we happened to
+          // handle the scheduled LEADER_PARTITION_EVENT. In either case we should just ignore and don't retry.
+          _log.warn("partitions for {} is not found, ignore the partition assignment", toProcessDatastream.getName());
+        }
+      } else {
+        _log.warn("datastream group {} is not active, ignore the partition assignment", datastreamGroupName);
+      }
+
+      for (String key : assignmentByInstance.keySet()) {
+        newAssignmentsByInstance.put(key, new ArrayList<>(assignmentByInstance.get(key)));
+      }
+      _adapter.updateAllAssignments(newAssignmentsByInstance);
+      _log.info("Partition assignment completed: datastreamGroup {}, assignment {} ", datastreamGroupName,
+          assignmentByInstance);
+      succeeded = true;
+    } catch (Exception ex) {
+      _log.warn("Partition assignment failed, Exception: ", ex);
+      succeeded = false;
+    }
+    // schedule retry if failure
+    if (succeeded) {
+      _adapter.cleanupOldUnusedTasks(previousAssignmentByInstance, newAssignmentsByInstance);
+      updateCounterForMaxPartitionInTask(newAssignmentsByInstance);
+      _dynamicMetricsManager.createOrUpdateMeter(MODULE, NUM_PARTITION_ASSIGNMENTS, 1);
+    } else {
+      _dynamicMetricsManager.createOrUpdateMeter(MODULE, "handleLeaderPartitionAssignment", NUM_RETRIES, 1);
+      _executor.schedule(() -> {
+        _log.warn("Retry scheduled for leader partition assignment, dg {}", datastreamGroupName);
+        // We need to schedule both LEADER_DO_ASSIGNMENT and leader partition assignment in case the tasks are
+        // not locked because the assigned instance is dead. As we use a sticky assignment, the leader do assignment
+        // shouldn't generate too much extra costs
+        _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(false));
+        _eventQueue.put(CoordinatorEvent.createLeaderPartitionAssignmentEvent(datastreamGroupName));
+      }, _config.getRetryIntervalMs(), TimeUnit.MILLISECONDS);
+    }
+  }
+
+  private void updateCounterForMaxPartitionInTask(Map<String, List<DatastreamTask>> assignments) {
+    long maxPartitionCount = 0;
+    for (List<DatastreamTask> tasks : assignments.values()) {
+      maxPartitionCount = Math.max(maxPartitionCount,
+          tasks.stream().map(DatastreamTask::getPartitionsV2).map(List::size).mapToInt(v -> v).max().orElse(0));
+    }
+    _log.info("Max partition count assigned in the task {}", maxPartitionCount);
+    MAX_PARTITION_COUNT.getAndSet(maxPartitionCount);
+  }
+
+
+  private void onDatastreamChange(List<DatastreamGroup> datastreamGroups) {
+    //We need to perform handleDatastream only active datastream for partition listening
+    List<DatastreamGroup> activeDataStreams = datastreamGroups.stream().filter(dg -> !dg.isPaused()).collect(Collectors.toList());
+
+    for (String connectorType : _connectors.keySet()) {
+      ConnectorWrapper connectorWrapper = _connectors.get(connectorType).getConnector();
+
+      List<DatastreamGroup> datastreamsPerConnectorType = activeDataStreams.stream()
+          .filter(x -> x.getConnectorName().equals(connectorType))
+          .collect(Collectors.toList());
+
+      connectorWrapper.getConnectorInstance().handleDatastream(datastreamsPerConnectorType);
+    }
+  }
+
+  /**
+   * move the partitions based on targetAssignmentInfo stored in the Zookeeper
+   * @param notifyTimestamp the timestamp when partition movement is triggered
+   */
+  private void performPartitionMovement(Long notifyTimestamp) {
+    boolean shouldRetry = true;
+    Map<String, Set<DatastreamTask>> previousAssignmentByInstance = _adapter.getAllAssignedDatastreamTasks();
+    Map<String, List<DatastreamTask>> newAssignmentsByInstance = new HashMap<>();
+
+    try {
+      Map<String, Set<DatastreamTask>> assignmentByInstance = new HashMap<>(previousAssignmentByInstance);
+      List<DatastreamGroup> toCleanup = new ArrayList<>();
+
+      for (String connectorType : _connectors.keySet()) {
+        AssignmentStrategy strategy = _connectors.get(connectorType).getAssignmentStrategy();
+        Connector connectorInstance = _connectors.get(connectorType).getConnector().getConnectorInstance();
+
+        // Get the partition assignment information
+        Map<String, Optional<DatastreamGroupPartitionsMetadata>> datastreamPartitions =
+            connectorInstance.getDatastreamPartitions();
+
+        // Get the datastream Group name which have the target assignment
+        List<String> toMoveDatastream = _adapter.getDatastreamsNeedPartitionMovement(connectorType);
+
+        // Fetch all live datastreamGroups
+        List<DatastreamGroup> liveDatastreamGroups =
+            fetchDatastreamGroups().stream().filter(group1 -> connectorType.equals(group1.getConnectorName())).collect(
+                Collectors.toList());
+
+        // clean up the datastreams if they are not in the live datastreams
+        toMoveDatastream.stream().filter(dgName -> !liveDatastreamGroups.stream().map(DatastreamGroup::getName)
+            .collect(Collectors.toList()).contains(dgName)).forEach(obsoleteDs ->
+            _adapter.cleanUpPartitionMovement(connectorType, obsoleteDs, notifyTimestamp));
+
+        // Filtered all live datastreamGroup as we process only datastream which have
+        // both partition assignment info and the target assignment
+        List<DatastreamGroup> toProcessedDatastreamGroups =
+            liveDatastreamGroups.stream().filter(group2 -> toMoveDatastream.contains(group2.getName()))
+                .filter(group3 -> datastreamPartitions.keySet().contains(group3.getName()))
+                .collect(Collectors.toList());
+
+        for (DatastreamGroup dg : toProcessedDatastreamGroups) {
+          // Right now we fails the entire partition movement if any failure is encountered in any datastreamGroup
+          // The behavior can be improved to enhance the isolation in partition movement from different datastreamGroups
+          DatastreamGroupPartitionsMetadata subscribedPartitions = connectorInstance.getDatastreamPartitions().get(dg.getName())
+              .orElseThrow(() -> new DatastreamTransientException("partition listener is not ready yet for datastream " + dg.getName()));
+          Map<String, Set<String>> suggestedAssignment =
+              _adapter.getPartitionMovement(dg.getConnectorName(), dg.getName(), notifyTimestamp);
+          assignmentByInstance = strategy.movePartitions(assignmentByInstance, suggestedAssignment,
+              subscribedPartitions);
+          toCleanup.add(dg);
+        }
+      }
+
+      for (String key : assignmentByInstance.keySet()) {
+        newAssignmentsByInstance.put(key, new ArrayList<>(assignmentByInstance.get(key)));
+      }
+
+      _adapter.updateAllAssignments(newAssignmentsByInstance);
+
+      //clean up stored target assignment after the assignment is updated
+      for (DatastreamGroup dg : toCleanup) {
+        _adapter.cleanUpPartitionMovement(dg.getConnectorName(), dg.getName(), notifyTimestamp);
+      }
+
+      _log.info("Partition movement completed: datastreamGroup, assignment {} ", assignmentByInstance);
+
+      shouldRetry = false;
+    } catch (DatastreamTransientException ex) {
+      _log.warn("Partition movement failed, retry again after a configurable period", ex);
+      shouldRetry = true;
+    } catch (Exception ex) {
+      // We do not retry if it is not transient exception. Unfortunately we don't have a good way to communicate to the
+      // caller about individual failure as partition movement is an async process. A caller could only verify if the
+      // request is completed by query the assignment
+
+      _log.error("Partition movement failed, Exception: ", ex);
+      _dynamicMetricsManager.createOrUpdateMeter(MODULE, "handleLeaderPartitionMovement", NUM_ERRORS, 1);
+
+    }
+    if (!shouldRetry) {
+      _adapter.cleanupOldUnusedTasks(previousAssignmentByInstance, newAssignmentsByInstance);
+      updateCounterForMaxPartitionInTask(newAssignmentsByInstance);
+      _dynamicMetricsManager.createOrUpdateMeter(MODULE, NUM_PARTITION_MOVEMENTS, 1);
+    }  else {
+      _log.info("Schedule retry for leader movement tasks");
+      _dynamicMetricsManager.createOrUpdateMeter(MODULE, "handleLeaderPartitionMovement", NUM_RETRIES, 1);
+      _executor.schedule(() -> {
+        _eventQueue.put(CoordinatorEvent.createPartitionMovementEvent(notifyTimestamp));
       }, _config.getRetryIntervalMs(), TimeUnit.MILLISECONDS);
     }
   }
@@ -954,7 +1218,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     Set<DatastreamGroup> pausedDatastreamGroups =
         datastreamGroups.stream().filter(DatastreamGroup::isPaused).collect(Collectors.toSet());
 
-    _pausedDatastreamsGroups.set(pausedDatastreamGroups.size());
+    PAUSED_DATASTREAMS_GROUPS.set(pausedDatastreamGroups.size());
 
     // If a datastream group is paused, park tasks with the virtual PausedInstance.
     List<DatastreamTask> pausedTasks = pausedTasks(pausedDatastreamGroups, previousAssignmentByInstance);
@@ -993,6 +1257,13 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     }
 
     return newAssignmentsByInstance;
+  }
+
+  void performCleanupOrphanConnectorTasks() {
+    _log.info("performCleanupOrphanConnectorTasks called");
+    int orphanCount = _adapter.cleanUpOrphanConnectorTasks(_config.getZkCleanUpOrphanConnectorTask());
+    _dynamicMetricsManager.createOrUpdateMeter(MODULE, "performCleanupOrphanConnectorTasks",
+        NUM_ORPHAN_CONNECTOR_TASKS, orphanCount);
   }
 
   /**
@@ -1036,8 +1307,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     Validate.notEmpty(connectorName, "connectorName cannot be empty");
     Validate.notNull(connector, "Connector cannot be null");
 
-    _log.info("Add new connector of type {}, strategy {} with custom checkpointing {} to coordinator",
-        connectorName, strategy.getClass().getTypeName(), customCheckpointing);
+    _log.info("Add new connector of type {}, strategy {} with custom checkpointing {} to coordinator", connectorName,
+        strategy.getClass().getTypeName(), customCheckpointing);
 
     if (_connectors.containsKey(connectorName)) {
       String err = "A connector of type " + connectorName + " already exists.";
@@ -1047,6 +1318,11 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
     Optional<List<BrooklinMetricInfo>> connectorMetrics = Optional.ofNullable(connector.getMetricInfos());
     connectorMetrics.ifPresent(_metrics::addAll);
+
+
+    connector.onPartitionChange(datastreamGroup ->
+      _eventQueue.put(CoordinatorEvent.createLeaderPartitionAssignmentEvent(datastreamGroup.getName()))
+    );
 
     ConnectorInfo connectorInfo =
         new ConnectorInfo(connectorName, connector, strategy, customCheckpointing, _cpProvider, deduper, authorizerName);
@@ -1089,6 +1365,35 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       throw e;
     }
   }
+
+  /**
+   * Validate the partition is managed by connector for this datastream
+   * @param datastream datastream which needs the verification
+   * @throws DatastreamValidationException if partition assignment is not supported
+   */
+  public void validatePartitionAssignmentSupported(Datastream datastream) throws DatastreamValidationException {
+    try {
+      String connectorName = datastream.getConnectorName();
+      ConnectorInfo connectorInfo = _connectors.get(connectorName);
+      if (connectorInfo == null) {
+        throw new DatastreamValidationException("Invalid connector: " + connectorName);
+      }
+
+      Connector connectorInstance = connectorInfo.getConnector().getConnectorInstance();
+
+      if (!connectorInstance.isPartitionManagementSupported()) {
+        String msg = String.format("Partition assignment is not managed by connector, datastream %s",
+            datastream.getName());
+        _log.error(msg);
+        throw new DatastreamValidationException(msg);
+      }
+
+    } catch (Exception e) {
+      _dynamicMetricsManager.createOrUpdateMeter(MODULE, "isPartitionAssignmentSupported", NUM_ERRORS, 1);
+      throw e;
+    }
+  }
+
 
   /**
    * Checks if given datastream update type is supported by connector for given datastream.
@@ -1262,6 +1567,9 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   public List<BrooklinMetricInfo> getMetricInfos() {
     _metrics.add(new BrooklinMeterInfo(buildMetricName(MODULE, NUM_REBALANCES)));
     _metrics.add(new BrooklinMeterInfo(buildMetricName(MODULE, NUM_ASSIGNMENT_CHANGES)));
+    _metrics.add(new BrooklinMeterInfo(buildMetricName(MODULE, NUM_PARTITION_ASSIGNMENTS)));
+    _metrics.add(new BrooklinMeterInfo(buildMetricName(MODULE, NUM_PARTITION_MOVEMENTS)));
+    _metrics.add(new BrooklinGaugeInfo(buildMetricName(MODULE, MAX_PARTITION_COUNT_IN_TASK)));
     _metrics.add(new BrooklinMeterInfo(getDynamicMetricPrefixRegex(MODULE) + NUM_ERRORS));
     _metrics.add(new BrooklinMeterInfo(getDynamicMetricPrefixRegex(MODULE) + NUM_RETRIES));
     _metrics.add(new BrooklinCounterInfo(buildMetricName(MODULE, NUM_HEARTBEATS)));
@@ -1351,7 +1659,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     @Override
     public void run() {
       _log.info("START CoordinatorEventProcessor thread");
-      while (!isInterrupted()) {
+      while (!_shutdown && !isInterrupted()) {
         try {
           CoordinatorEvent event = _eventQueue.take();
           if (event != null) {
@@ -1366,5 +1674,15 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       }
       _log.info("END CoordinatorEventProcessor");
     }
+  }
+
+  @VisibleForTesting
+  ZkAdapter getZkAdapter() {
+    return _adapter;
+  }
+
+  @VisibleForTesting
+  CoordinatorConfig getConfig() {
+    return _config;
   }
 }

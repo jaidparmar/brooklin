@@ -60,10 +60,26 @@ public final class KeyBuilder {
    */
   private static final String DATASTREAM_TASK_CONFIG = CONNECTOR + "/%s/config";
 
+
   /**
-   * Task lock node under connectorType/task
+   * Task lock root path under connectorType
    */
-  private static final String DATASTREAM_TASK_LOCK = CONNECTOR + "/%s/lock";
+  private static final String DATASTREAM_TASK_LOCK_ROOT = CONNECTOR + "/lock";
+
+  /**
+   * Task lock node under connectorType/lock/{taskName}
+   */
+  private static final String DATASTREAM_TASK_LOCK = DATASTREAM_TASK_LOCK_ROOT + "/%s";
+
+  /**
+   * Base path to store partition movement info
+   */
+  private static final String TARGET_ASSIGNMENT_BASE = CONNECTOR + "/targetAssignment";
+
+  /**
+   * partition movement info under connectorType/targetAssignment/datastreamGroup
+   */
+  private static final String TARGET_ASSIGNMENTS = TARGET_ASSIGNMENT_BASE + "/%s";
 
   /**
    * Get the root level ZooKeeper znode of a Brooklin cluster
@@ -244,15 +260,50 @@ public final class KeyBuilder {
     return String.format(DATASTREAM_TASK_STATE_KEY, cluster, connectorType, datastreamTask, key).replaceAll("//", "/");
   }
 
+
+  /**
+   * Get the ZooKeeper path to store lock
+   *
+   * <pre>Example: /{cluster}/connectors/{connectorType}/lock</pre>
+   * @param cluster Brooklin cluster name
+   * @param connectorType Connector
+  \   */
+  public static String datastreamTaskLockRoot(String cluster, String connectorType) {
+    return String.format(DATASTREAM_TASK_LOCK_ROOT, cluster, connectorType).replaceAll("//", "/");
+  }
+
   /**
    * Get the ZooKeeper znode for a specific datastream task's lock
+   * The lock is ephemeral node and it should not be stored under task node
    *
-   * <pre>Example: /{cluster}/connectors/{connectorType}/{taskName}/config</pre>
+   * <pre>Example: /{cluster}/connectors/{connectorType}/lock/{taskName}</pre>
    * @param cluster Brooklin cluster name
    * @param connectorType Connector
    * @param datastreamTask Datastream task name
 \   */
   public static String datastreamTaskLock(String cluster, String connectorType, String datastreamTask) {
     return String.format(DATASTREAM_TASK_LOCK, cluster, connectorType, datastreamTask).replaceAll("//", "/");
+  }
+
+
+  /**
+   * Get the partition movement information for a specific datastream group
+   * @param cluster Brooklin cluster name
+   * @param connectorType Connector
+   * @param datastreamGroupName Datastream group name
+   * @return
+   */
+  public static String getTargetAssignmentPath(String cluster, String connectorType, String datastreamGroupName) {
+    return String.format(TARGET_ASSIGNMENTS, cluster, connectorType, datastreamGroupName).replaceAll("//", "/'");
+  }
+
+  /**
+   * Get all partition movement information
+   * @param cluster Brooklin cluster name
+   * @param connectorType Connector
+   * @return
+   */
+  public static String getTargetAssignmentBase(String cluster, String connectorType) {
+    return String.format(TARGET_ASSIGNMENT_BASE, cluster, connectorType).replaceAll("//", "/'");
   }
 }

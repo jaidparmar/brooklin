@@ -5,7 +5,7 @@
  */
 package com.linkedin.datastream.common.zk;
 
-import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
@@ -36,39 +36,52 @@ public class ZkClient extends org.I0Itec.zkclient.ZkClient {
   public static final String ZK_PATH_SEPARATOR = "/";
   public static final int DEFAULT_CONNECTION_TIMEOUT = 60 * 1000;
   public static final int DEFAULT_SESSION_TIMEOUT = 30 * 1000;
+  public static final int DEFAULT_OPERATION_RETRY_TIMEOUT = -1;
 
   private static final Logger LOG = LoggerFactory.getLogger(ZkClient.class);
 
   private final ZkSerializer _zkSerializer = new ZKStringSerializer();
-  private int _zkSessionTimeoutMs = DEFAULT_SESSION_TIMEOUT;
-
-  /**
-   * Constructor for ZkClient
-   * @param zkServers the ZooKeeper connection String
-   * @param sessionTimeout the session timeout in milliseconds
-   * @param connectionTimeout the connection timeout in milliseconds
-   */
-  public ZkClient(String zkServers, int sessionTimeout, int connectionTimeout) {
-    super(zkServers, sessionTimeout, connectionTimeout, new ZKStringSerializer());
-
-    _zkSessionTimeoutMs = sessionTimeout;
-  }
-
-  /**
-   * Constructor for ZkClient
-   * @param zkServers the ZooKeeper connection String
-   * @param connectionTimeout the connection timeout in milliseconds
-   */
-  public ZkClient(String zkServers, int connectionTimeout) {
-    super(zkServers, DEFAULT_SESSION_TIMEOUT, connectionTimeout, new ZKStringSerializer());
-  }
+  private int _zkSessionTimeoutMs;
 
   /**
    * Constructor for ZkClient
    * @param zkServers the ZooKeeper connection String
    */
   public ZkClient(String zkServers) {
-    super(zkServers, DEFAULT_SESSION_TIMEOUT, DEFAULT_CONNECTION_TIMEOUT, new ZKStringSerializer());
+    this(zkServers, DEFAULT_SESSION_TIMEOUT);
+  }
+
+  /**
+   * Constructor for ZkClient
+   * @param zkServers the ZooKeeper connection String
+   * @param sessionTimeoutMs the session timeout in milliseconds
+   */
+  public ZkClient(String zkServers, int sessionTimeoutMs) {
+    this(zkServers, sessionTimeoutMs, DEFAULT_CONNECTION_TIMEOUT);
+  }
+
+  /**
+   * Constructor for ZkClient
+   * @param zkServers the ZooKeeper connection String
+   * @param sessionTimeoutMs the session timeout in milliseconds
+   * @param connectionTimeoutMs the connection timeout in milliseconds
+   */
+  public ZkClient(String zkServers, int sessionTimeoutMs, int connectionTimeoutMs) {
+    this(zkServers, sessionTimeoutMs, connectionTimeoutMs, DEFAULT_OPERATION_RETRY_TIMEOUT);
+  }
+
+  /**
+   * Constructor for ZkClient
+   * @param zkServers the ZooKeeper connection String
+   * @param sessionTimeoutMs the session timeout in milliseconds
+   * @param connectionTimeoutMs the connection timeout in milliseconds
+   * @param operationRetryTimeoutMs The maximum amount of time, in milli seconds, each failed
+   *                                operation is retried. A value lesser than 0 is considered as
+   *                                retry forever until a connection has been reestablished.
+   */
+  public ZkClient(String zkServers, int sessionTimeoutMs, int connectionTimeoutMs, int operationRetryTimeoutMs) {
+    super(zkServers, sessionTimeoutMs, connectionTimeoutMs, new ZKStringSerializer(), operationRetryTimeoutMs);
+    _zkSessionTimeoutMs = sessionTimeoutMs;
   }
 
   @Override
@@ -85,26 +98,24 @@ public class ZkClient extends org.I0Itec.zkclient.ZkClient {
       LOG.info("closing zkclient: {}", ((ZkConnection) _connection).getZookeeper());
       super.close();
     } catch (ZkInterruptedException e) {
-      /**
+      /*
        * Workaround for HELIX-264: calling ZkClient#disconnect() in its own eventThread context will
        * throw ZkInterruptedException and skip ZkConnection#disconnect()
        */
-      if (_connection != null) {
-        try {
-          /**
-           * ZkInterruptedException#construct() honors InterruptedException by calling
-           * Thread.currentThread().interrupt(); clear it first, so we can safely disconnect the
-           * zk-connection
-           */
-          Thread.interrupted();
-          _connection.close();
-          /**
-           * restore interrupted status of current thread
-           */
-          Thread.currentThread().interrupt();
-        } catch (InterruptedException e1) {
-          throw new ZkInterruptedException(e1);
-        }
+      try {
+        /*
+         * ZkInterruptedException#construct() honors InterruptedException by calling
+         * Thread.currentThread().interrupt(); clear it first, so we can safely disconnect the
+         * zk-connection
+         */
+        Thread.interrupted();
+        _connection.close();
+        /*
+         * restore interrupted status of current thread
+         */
+        Thread.currentThread().interrupt();
+      } catch (InterruptedException e1) {
+        throw new ZkInterruptedException(e1);
       }
     } finally {
       getEventLock().unlock();
@@ -338,11 +349,7 @@ public class ZkClient extends org.I0Itec.zkclient.ZkClient {
     @Override
     public byte[] serialize(Object data) throws ZkMarshallingError {
       byte[] ret = null;
-      try {
-        ret = ((String) data).getBytes("UTF-8");
-      } catch (UnsupportedEncodingException e) {
-        LOG.error(e.getMessage());
-      }
+      ret = ((String) data).getBytes(StandardCharsets.UTF_8);
       return ret;
     }
 
@@ -350,11 +357,7 @@ public class ZkClient extends org.I0Itec.zkclient.ZkClient {
     public Object deserialize(byte[] bytes) throws ZkMarshallingError {
       String data = null;
       if (bytes != null) {
-        try {
-          data = new String(bytes, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-          LOG.error(e.getMessage());
-        }
+        data = new String(bytes, StandardCharsets.UTF_8);
       }
       return data;
     }
