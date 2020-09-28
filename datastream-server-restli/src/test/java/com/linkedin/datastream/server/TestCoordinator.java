@@ -74,6 +74,7 @@ import com.linkedin.datastream.server.zk.KeyBuilder;
 import com.linkedin.datastream.server.zk.ZkAdapter;
 import com.linkedin.datastream.testutil.DatastreamTestUtils;
 import com.linkedin.datastream.testutil.EmbeddedZookeeper;
+import com.linkedin.datastream.testutil.MetricsTestUtils;
 import com.linkedin.restli.common.HttpStatus;
 import com.linkedin.restli.server.BatchUpdateRequest;
 import com.linkedin.restli.server.CreateResponse;
@@ -101,6 +102,7 @@ import static org.mockito.Mockito.when;
 /**
  * Tests for {@link Coordinator}
  */
+@Test
 public class TestCoordinator {
   private static final Logger LOG = LoggerFactory.getLogger(TestCoordinator.class);
   private static final long WAIT_DURATION_FOR_ZK = Duration.ofMinutes(1).toMillis();
@@ -174,6 +176,20 @@ public class TestCoordinator {
     _embeddedZookeeper.shutdown();
   }
 
+  @Test
+  public void testRegistersMetricsCorrectly() throws Exception {
+    String testCluster = "testCoordinatorMetrics";
+    Coordinator coordinator = createCoordinator(_zkConnectionString, testCluster);
+    coordinator.start();
+
+    // Make sure the set of metrics the Coordinator registers with the DynamicMetricsManager
+    // matches the metricInfos the Coordinator returns from getMetricInfos().
+    MetricsTestUtils.verifyMetrics(coordinator, DynamicMetricsManager.getInstance());
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+  }
+
   /**
    * testConnectorStateSetAndGet makes sure that the connector can read and write state that
    * is specific to each DatastreamTask.
@@ -241,6 +257,7 @@ public class TestCoordinator {
     // should be called once
     //
     PollUtils.poll(() -> taskNames.size() == 1, 500, 30000);
+    Assert.assertEquals(taskNames.size(), 1);
     String name1 = (String) taskNames.toArray()[0];
     String datastream1CounterPath = KeyBuilder.datastreamTaskStateKey(testCluster, testConnectorType, name1, "counter");
     Assert.assertTrue(PollUtils.poll(zkClient::exists, 500, 30000, datastream1CounterPath));
@@ -255,13 +272,12 @@ public class TestCoordinator {
     String datastream2CounterPath = KeyBuilder.datastreamTaskStateKey(testCluster, testConnectorType, name2, "counter");
     Assert.assertTrue(PollUtils.poll(zkClient::exists, 500, 30000, datastream2CounterPath));
 
-    Thread.sleep(1000 * 60);
-
     //
     // clean up
     //
     zkClient.close();
     coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
   }
 
   @Test
@@ -286,9 +302,8 @@ public class TestCoordinator {
     instance.onAssignmentChange();
     instance.stop();
     Assert.assertTrue(latch.getCount() < 1);
+    instance.getDatastreamCache().getZkclient().close();
   }
-
-
 
   // verify that connector znodes are created as soon as Coordinator instance is started
   @Test
@@ -309,6 +324,7 @@ public class TestCoordinator {
 
     zkClient.close();
     instance1.stop();
+    instance1.getDatastreamCache().getZkclient().close();
   }
 
   /**
@@ -487,6 +503,7 @@ public class TestCoordinator {
     //
     instance1.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
   }
 
   @Test
@@ -526,6 +543,9 @@ public class TestCoordinator {
         DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName1).getStatus()), 200, WAIT_TIMEOUT_MS));
     Assert.assertTrue(PollUtils.poll(() -> (zkClient.getChildren(instance1Path).size() != 0), 200, WAIT_TIMEOUT_MS));
 
+    instance1.stop();
+    instance1.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
     /**
@@ -574,7 +594,7 @@ public class TestCoordinator {
     }
     waitTillAssignmentIsComplete(16, WAIT_TIMEOUT_MS, connectors.toArray(new TestHookConnector[connectors.size()]));
 
-    //Verify the assignment, each datastream should be assigned to four tasks
+    // Verify the assignment, each datastream should be assigned to four tasks
     Map<String, List<Connector>> assignment1 = collectDatastreamAssignment(connectors);
     assignment1.values().forEach(set -> Assert.assertEquals(set.size(), 4));
 
@@ -585,20 +605,20 @@ public class TestCoordinator {
 
     waitTillAssignmentIsComplete(12, WAIT_TIMEOUT_MS, connectors.toArray(new TestHookConnector[connectors.size()]));
 
-    //Verify the assignment for datastream1, datastream2, datastream4 are still the same, but not the case for ds3
+    // Verify the assignment for datastream1, datastream2, datastream4 are still the same, but not the case for ds3
     Map<String, List<Connector>> assignment2 = collectDatastreamAssignment(connectors);
     Assert.assertEquals(assignment1.get("datastream1"), assignment2.get("datastream1"));
     Assert.assertEquals(assignment1.get("datastream2"), assignment2.get("datastream2"));
     Assert.assertEquals(assignment1.get("datastream4"), assignment2.get("datastream4"));
     Assert.assertFalse(assignment2.containsKey("datastream3"));
 
-    //resume the data stream
+    // resume the data stream
     ds3 = DatastreamTestUtils.getDatastream(zkClient, testCluster, "datastream3");
     ds3.setStatus(DatastreamStatus.READY);
     DatastreamTestUtils.updateDatastreams(zkClient, testCluster, ds3);
     waitTillAssignmentIsComplete(16, WAIT_TIMEOUT_MS, connector1, connector2, connector3);
 
-    //verify the assignment is still sticky, same as previous assignment
+    // verify the assignment is still sticky, same as previous assignment
     Map<String, List<Connector>> assignment3 = collectDatastreamAssignment(connectors);
     Assert.assertEquals(assignment1.get("datastream1"), assignment3.get("datastream1"));
     Assert.assertEquals(assignment1.get("datastream2"), assignment3.get("datastream2"));
@@ -606,14 +626,14 @@ public class TestCoordinator {
     Assert.assertEquals(assignment3.get("datastream3").size(), 4);
     waitTillAssignmentIsComplete(16, WAIT_TIMEOUT_MS, connectors.toArray(new TestHookConnector[connectors.size()]));
 
-    //Stop the instance 1, force a leader change
+    // Stop the instance 1, force a leader change
     instance1.stop();
     deleteLiveInstanceNode(zkClient, testCluster, instance1);
 
     connectors.remove(0);
     waitTillAssignmentIsComplete(16, WAIT_TIMEOUT_MS, connectors.toArray(new TestHookConnector[connectors.size()]));
 
-    //now add another instance, make sure it's getting rebalanced
+    // now add another instance, make sure it's getting rebalanced
     Coordinator instance4 = createCoordinator(_zkConnectionString, testCluster);
     TestHookConnector connector4 = new TestHookConnector("connector4", testConnectorType);
     instance4.addConnector(testConnectorType, connector4, new StickyMulticastStrategy(Optional.of(4), Optional.of(2)), false,
@@ -621,12 +641,17 @@ public class TestCoordinator {
     instance4.start();
 
     connectors.add(connector4);
-    //verify connector4 get at least 5 task assignment
+    // verify connector4 get at least 5 task assignment
     waitTillAssignmentIsComplete(5, WAIT_TIMEOUT_MS, connector4);
 
     instance2.stop();
     instance3.stop();
     instance4.stop();
+
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
+    instance3.getDatastreamCache().getZkclient().close();
+    instance4.getDatastreamCache().getZkclient().close();
 
     zkClient.close();
   }
@@ -680,7 +705,7 @@ public class TestCoordinator {
 
     Assert.assertTrue(
         PollUtils.poll(() -> {
-      //Verify all the partitions are assigned
+      // Verify all the partitions are assigned
       Map<String, List<String>> assignment2 = collectDatastreamPartitions(connectors);
       return assignment2.get("datastream1").size() == partitions1.size() && assignment2.get("datastream2").size() == partitions2.size();
     }, interval, WAIT_TIMEOUT_MS));
@@ -689,6 +714,9 @@ public class TestCoordinator {
     instance3.stop();
 
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
+    instance3.getDatastreamCache().getZkclient().close();
   }
 
   private TestHookConnector createConnectorWithPartitionListener(String name, String connectorType,
@@ -724,7 +752,7 @@ public class TestCoordinator {
 
       @Override
       public void onAssignmentChange(List<DatastreamTask> tasks) {
-        _tasks.forEach(t -> t.release());
+        _tasks.forEach(DatastreamTask::release);
         _tasks = tasks;
         _tasks.forEach(t -> t.acquire(Duration.ofSeconds(10)));
       }
@@ -737,7 +765,7 @@ public class TestCoordinator {
 
       @Override
       public void stop() {
-        _tasks.forEach(t -> t.release());
+        _tasks.forEach(DatastreamTask::release);
         super.stop();
         if (_callbackThread != null) {
           _callbackThread.interrupt();
@@ -815,6 +843,9 @@ public class TestCoordinator {
 
     ds2.getDestination().setConnectionString("testDestination2"); // Should succeed with a different destination
     resource.create(ds2);
+    coordinator.stop();
+    zkClient.close();
+    coordinator.getDatastreamCache().getZkclient().close();
   }
 
   private void assertConnectorReceiveDatastreamUpdate(TestHookConnector connector, Datastream updatedDatastream)
@@ -864,6 +895,10 @@ public class TestCoordinator {
     Assert.assertTrue(PollUtils.poll(() -> !zkClient.exists(path), 200, WAIT_TIMEOUT_MS));
     Assert.assertEquals(transportProviderAdminFactory._dropDestinationCount, 0,
         "Delete destination count should have been 0, since Datastream uses BYOT");
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   /**
@@ -902,6 +937,10 @@ public class TestCoordinator {
     Assert.assertTrue(PollUtils.poll(() -> !zkClient.exists(path), 200, WAIT_TIMEOUT_MS));
     Assert.assertEquals(transportProviderAdminFactory._dropDestinationCount, 0,
         "Delete destination count should have been 0, since Datastream has connector-managed destination");
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   /**
@@ -941,6 +980,9 @@ public class TestCoordinator {
     Assert.assertTrue(
         PollUtils.poll(() -> transportProviderAdminFactory._dropDestinationCount == 1, 1000, WAIT_TIMEOUT_MS),
         "Delete destination count should have been 1, since Datastream does not have connector-managed destination");
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   @Test
@@ -967,15 +1009,12 @@ public class TestCoordinator {
         new SourceBasedDeduper(), null);
     coordinator.start();
 
-
-
     ZkClient zkClient = new ZkClient(_zkConnectionString);
     List<TestHookConnector> connectors = new ArrayList<>();
     connectors.add(connector1);
     connectors.add(connector2);
     Datastream [] datastream1  = DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, connectorType1, "datastream1");
     Datastream [] datastream2  = DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, connectorType2, "datastream2");
-
 
     Assert.assertTrue(PollUtils.poll(() -> {
       try {
@@ -992,6 +1031,10 @@ public class TestCoordinator {
     } catch (DatastreamValidationException e) {
       LOG.info("Caught exception as partition assignment is not supported");
     }
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   @Test
@@ -1045,6 +1088,9 @@ public class TestCoordinator {
     }
 
     coordinator.validateDatastreamsUpdate(Arrays.asList(datastreams.get(2), datastreams.get(3)));
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   @Test
@@ -1093,6 +1139,12 @@ public class TestCoordinator {
 
     assertConnectorReceiveDatastreamUpdate(connector1, datastream);
     assertConnectorReceiveDatastreamUpdate(connector2, datastream);
+
+    coordinator1.stop();
+    coordinator1.getDatastreamCache().getZkclient().close();
+    coordinator2.stop();
+    coordinator2.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   @Test
@@ -1168,6 +1220,9 @@ public class TestCoordinator {
     instance1.stop();
     instance2.stop();
     zkClient.close();
+
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1268,6 +1323,8 @@ public class TestCoordinator {
     instance1.stop();
     instance2.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1385,6 +1442,9 @@ public class TestCoordinator {
     instance1.stop();
     instance2.stop();
     instance3.stop();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
+    instance3.getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1470,6 +1530,7 @@ public class TestCoordinator {
     //
     instance1.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
   }
 
   @Test
@@ -1549,6 +1610,7 @@ public class TestCoordinator {
     //
     instance1.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1657,6 +1719,9 @@ public class TestCoordinator {
     //
     instance3.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
+    instance3.getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1708,6 +1773,7 @@ public class TestCoordinator {
     for (int i = 1; i < count; i++) {
       coordinators[i].stop();
       deleteLiveInstanceNode(zkClient, testCluster, coordinators[i]);
+      coordinators[i].getDatastreamCache().getZkclient().close();
     }
 
     LOG.info("Check whether all the instances are assigned to the only remaining instance.");
@@ -1726,6 +1792,7 @@ public class TestCoordinator {
     //
     coordinators[0].stop();
     zkClient.close();
+    coordinators[0].getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1793,6 +1860,8 @@ public class TestCoordinator {
     instance1.stop();
     instance2.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
   }
 
   //
@@ -1864,6 +1933,8 @@ public class TestCoordinator {
     instance1.stop();
     instance2.stop();
     zkClient.close();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
   }
 
   @Test
@@ -1915,6 +1986,7 @@ public class TestCoordinator {
     //
     zkClient.close();
     instance1.stop();
+    instance1.getDatastreamCache().getZkclient().close();
   }
 
   private void doTestTaskAssignmentAfterDestinationDedupe(String testName, boolean compat) throws Exception {
@@ -1959,6 +2031,9 @@ public class TestCoordinator {
     Assert.assertEquals(connector.getTasks().size(), 1);
 
     Assert.assertEquals(connector.getTasks().get(0), task1);
+    zkClient.close();
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
   }
 
   /**
@@ -2090,12 +2165,15 @@ public class TestCoordinator {
       return null;
     }).when(dynMM).createOrUpdateCounter(anyString(), anyObject(), anyLong());
 
-    ReflectionUtils.setField(coordinator, "_dynamicMetricsManager", dynMM);
+    Object metrics = ReflectionUtils.getField(coordinator, "_metrics");
+    ReflectionUtils.setField(metrics, "_dynamicMetricsManager", dynMM);
 
     coordinator.start();
 
     // Wait up to 30s for the first heartbeat
     Assert.assertTrue(PollUtils.poll(() -> counter.get() >= 1, 1000, 30000));
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
   }
 
   @Test
@@ -2117,6 +2195,9 @@ public class TestCoordinator {
 
     instance1.stop();
     Assert.assertTrue(PollUtils.poll(() -> instance2.getIsLeader().getAsBoolean(), 100, 30000));
+    instance2.stop();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
   }
 
   @Test
@@ -2178,7 +2259,15 @@ public class TestCoordinator {
     Assert.assertEquals(createResponse.getStatus(), HttpStatus.S_201_CREATED);
 
     // Poll up to 30s for stream1 to get deleted
-    PollUtils.poll(() -> setup._resource.get(streams[0].getName()) == null, 200, Duration.ofSeconds(30).toMillis());
+    PollUtils.poll(() -> {
+      try {
+        setup._resource.get(streams[0].getName());
+        return false;
+      } catch (RestLiServiceException e) {
+        Assert.assertEquals(e.getStatus(), HttpStatus.S_404_NOT_FOUND);
+        return true;
+      }
+    }, 200, Duration.ofSeconds(30).toMillis());
   }
 
   @Test
@@ -2278,6 +2367,8 @@ public class TestCoordinator {
         PollUtils.poll(() -> reader.getDatastream("testCachedDatastreamReader1", false) == null, 200, WAIT_TIMEOUT_MS));
     Assert.assertFalse(reader.getAllDatastreams(false).isEmpty());
     Assert.assertEquals(reader.getDatastreamGroups().size(), 1);
+
+    zkClient.close();
   }
 
   @Test
@@ -2332,6 +2423,10 @@ public class TestCoordinator {
     Assert.assertEquals(DatastreamUtils.getDatastreamSourcePartitions(task.getDatastreams()
         .get(0)),
         DatastreamUtils.parseSourcePartitionsStringMap(pausedPartitions));
+
+    mmCoordinator.stop();
+    mmCoordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   // Make sure mirror maker operations are prohibited for others
@@ -2392,6 +2487,10 @@ public class TestCoordinator {
       exceptionReceived = true;
     }
     Assert.assertTrue(exceptionReceived);
+
+    nonMmCoordinator.stop();
+    nonMmCoordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
   @Test
@@ -2451,9 +2550,13 @@ public class TestCoordinator {
 
     // Explicitly check the additional metadata
     Assert.assertEquals(datastreams[1].getMetadata().get(destMetaKey), destMetaVal);
+
+    coordinator1.stop();
+    coordinator1.getDatastreamCache().getZkclient().close();
+    zkClient.close();
   }
 
-  private class TestCoordinatorWithSpyZkAdapter extends Coordinator {
+  private static class TestCoordinatorWithSpyZkAdapter extends Coordinator {
 
     TestCoordinatorWithSpyZkAdapter(CachedDatastreamReader testDatastreamCache, Properties testConfig) throws DatastreamException {
       super(testDatastreamCache, testConfig);
@@ -2463,7 +2566,7 @@ public class TestCoordinator {
     ZkAdapter createZkAdapter() {
       return spy(new ZkAdapter(getConfig().getZkAddress(), getConfig().getCluster(),
           getConfig().getDefaultTransportProviderName(), getConfig().getZkSessionTimeout(),
-          getConfig().getZkConnectionTimeout(), this));
+          getConfig().getZkConnectionTimeout(), 1000, this));
     }
   }
 
@@ -2570,6 +2673,39 @@ public class TestCoordinator {
       }, 1000, WAIT_TIMEOUT_MS);
     verify(spyZkAdapter2, times(expectedCount)).cleanUpOrphanConnectorTasks(anyBoolean());
     instance2.stop();
+    instance1.getDatastreamCache().getZkclient().close();
+    instance2.getDatastreamCache().getZkclient().close();
+  }
+
+  @Test
+  public void testOnSessionExpired() throws Exception {
+    String testCluster = "testCoordinationSmoke3";
+    String testConnectorType = "testConnectorType";
+    String datastreamName = "datastreamNameSessionExpired";
+
+    Coordinator instance1 = createCoordinator(_zkConnectionString, testCluster);
+    instance1.addTransportProvider(DummyTransportProviderAdminFactory.PROVIDER_NAME,
+        new DummyTransportProviderAdminFactory().createTransportProviderAdmin(
+            DummyTransportProviderAdminFactory.PROVIDER_NAME, new Properties()));
+
+    TestHookConnector connector1 = new TestHookConnector("connector1", testConnectorType);
+    instance1.addConnector(testConnectorType, connector1, new BroadcastStrategy(Optional.empty()), false,
+        new SourceBasedDeduper(), null);
+    instance1.start();
+
+    ZkClient zkClient = new ZkClient(_zkConnectionString);
+    DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, testConnectorType, datastreamName);
+    // verify the assignment
+    assertConnectorAssignment(connector1, WAIT_TIMEOUT_MS, datastreamName);
+
+    instance1.onSessionExpired();
+    Assert.assertEquals(connector1._tasks.size(), 0);
+    Assert.assertEquals(instance1.getDatastreamTasks().size(), 0);
+    Thread t = instance1.getEventThread();
+    Assert.assertFalse(t != null && t.isAlive());
+    Assert.assertTrue(PollUtils.poll(instance1::isZkSessionExpired, 100, 30000));
+    instance1.stop();
+    instance1.getDatastreamCache().getZkclient().close();
   }
 
   // helper method: assert that within a timeout value, the connector are assigned the specific
@@ -2676,9 +2812,7 @@ public class TestCoordinator {
 
       _tasks = tasks;
       for (DatastreamTask task : tasks) {
-        if (task.getEventProducer() == null) {
-          Assert.assertNotNull(task.getEventProducer());
-        }
+        Assert.assertNotNull(task.getEventProducer());
       }
 
       LOG.info("END: onAssignmentChange");
