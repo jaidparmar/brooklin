@@ -89,6 +89,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
   private volatile Thread _connectorTaskThread;
   protected volatile boolean _shutdown = false;
   protected volatile long _lastPolledTimeMillis = System.currentTimeMillis();
+  protected volatile long _lastPollCompletedTimeMillis = 0;
   protected final CountDownLatch _startedLatch = new CountDownLatch(1);
   protected final CountDownLatch _stoppedLatch = new CountDownLatch(1);
 
@@ -102,7 +103,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
   protected final boolean _pausePartitionOnError;
   protected final Duration _pauseErrorPartitionDuration;
   protected final long _processingDelayLogThresholdMillis;
-  protected final boolean _enablePollDurationMillisMetric;
+  protected final boolean _enableAdditionalMetrics;
   protected final Optional<Map<Integer, Long>> _startOffsets;
 
   protected volatile String _taskName;
@@ -163,7 +164,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
     _maxRetryCount = config.getRetryCount();
     _pausePartitionOnError = config.getPausePartitionOnError();
     _pauseErrorPartitionDuration = config.getPauseErrorPartitionDuration();
-    _enablePollDurationMillisMetric = config.getEnablePollDurationMillisMetric();
+    _enableAdditionalMetrics = config.getEnableAdditionalMetrics();
     _startOffsets = Optional.ofNullable(_datastream.getMetadata().get(DatastreamMetadataConstants.START_POSITION))
         .map(json -> JsonUtils.fromJson(json, new TypeReference<Map<Integer, Long>>() {
         }));
@@ -172,12 +173,12 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
     _retrySleepDuration = config.getRetrySleepDuration();
     _commitTimeout = config.getCommitTimeout();
     _consumerMetrics = createKafkaBasedConnectorTaskMetrics(metricsPrefix, _datastreamName, _logger,
-        _enablePollDurationMillisMetric);
+        _enableAdditionalMetrics);
 
     _pollAttempts = new AtomicInteger();
     _groupIdConstructor = groupIdConstructor;
     _kafkaTopicPartitionTracker = new KafkaTopicPartitionTracker(
-        getKafkaGroupId(_datastreamTask, _groupIdConstructor, _consumerMetrics, logger));
+        getKafkaGroupId(_datastreamTask, _groupIdConstructor, _consumerMetrics, logger), _datastreamName);
   }
 
   protected static String generateMetricsPrefix(String connectorName, String simpleClassName) {
@@ -185,14 +186,9 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
   }
 
   protected KafkaBasedConnectorTaskMetrics createKafkaBasedConnectorTaskMetrics(String metricsPrefix, String key,
-      Logger errorLogger) {
-    return createKafkaBasedConnectorTaskMetrics(metricsPrefix, key, errorLogger, false);
-  }
-
-  protected KafkaBasedConnectorTaskMetrics createKafkaBasedConnectorTaskMetrics(String metricsPrefix, String key,
-      Logger errorLogger, boolean enablePollDurationMillisMetric) {
+      Logger errorLogger, boolean enableAdditionalMetrics) {
     KafkaBasedConnectorTaskMetrics consumerMetrics =
-        new KafkaBasedConnectorTaskMetrics(metricsPrefix, key, errorLogger, enablePollDurationMillisMetric);
+        new KafkaBasedConnectorTaskMetrics(metricsPrefix, key, errorLogger, enableAdditionalMetrics);
     consumerMetrics.createEventProcessingMetrics();
     consumerMetrics.createPollMetrics();
     consumerMetrics.createPartitionMetrics();
@@ -278,7 +274,6 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
       // Seek to last checkpoint failed. Throw an exception to avoid any data loss scenarios where the consumed
       // offset can be committed even though the send for that offset has failed.
       String errorMessage = String.format("Partition rewind for %s failed due to ", srcTopicPartition);
-      _logger.error(errorMessage, e);
       throw new DatastreamRuntimeException(errorMessage, e);
     }
     if (_pausePartitionOnError && !containsTransientException(ex)) {
@@ -358,6 +353,8 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
 
     try {
       _consumer = createKafkaConsumer(_consumerProps);
+      _consumerMetrics.registerKafkaConsumerMetrics(_consumer,
+          _consumerProps.getProperty(ConsumerConfig.CLIENT_ID_CONFIG));
       consumerSubscribe();
 
       ConsumerRecords<?, ?> records;
@@ -380,7 +377,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
           _kafkaTopicPartitionTracker.onPartitionsPolled(records);
 
           Instant readTime = Instant.now();
-          processRecords(records, readTime);
+          processRecords(records, readTime, System.nanoTime());
           recordsPolled = records.count();
         }
         maybeCommitOffsets(_consumer, false);
@@ -403,7 +400,6 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
       _datastreamTask.setStatus(DatastreamTaskStatus.error(e.toString() + ExceptionUtils.getFullStackTrace(e)));
       throw new DatastreamRuntimeException(e);
     } finally {
-      _stoppedLatch.countDown();
       if (null != _consumer) {
         try {
           _consumer.close();
@@ -412,6 +408,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
         }
       }
       postShutdownHook();
+      _stoppedLatch.countDown();
       _logger.info("{} stopped", _taskName);
     }
   }
@@ -476,8 +473,12 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
     try {
       long curPollTime = System.currentTimeMillis();
       _lastPolledTimeMillis = curPollTime;
+      if (_enableAdditionalMetrics && _lastPollCompletedTimeMillis != 0) {
+        _consumerMetrics.updateTimeSpentBetweenPollsMs(curPollTime - _lastPollCompletedTimeMillis);
+      }
       records = consumerPoll(pollInterval);
-      long pollDurationMillis = System.currentTimeMillis() - curPollTime;
+      _lastPollCompletedTimeMillis = System.currentTimeMillis();
+      long pollDurationMillis = _lastPollCompletedTimeMillis - curPollTime;
       if (pollDurationMillis > pollInterval + POLL_BUFFER_TIME_MILLIS) {
         // record poll time exceeding client poll timeout
         _logger.warn("ConsumerId: {}, Kafka client poll took {} ms (> poll timeout {} + buffer time {} ms)", _taskName,
@@ -486,7 +487,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
       }
       _consumerMetrics.updateNumPolls(1);
       _consumerMetrics.updateEventCountsPerPoll(records.count());
-      if (_enablePollDurationMillisMetric) {
+      if (_enableAdditionalMetrics) {
         _consumerMetrics.updatePollDurationMs(pollDurationMillis);
       }
       if (!records.isEmpty()) {
@@ -515,13 +516,21 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
    * Processes the Kafka consumer records by translating them and sending them to the event producer.
    * @param records the Kafka consumer records
    * @param readTime the time at which the records were successfully polled from Kafka
+   * @param readTimeInNanos the time at which the records were successfully polled from Kafka in nanoseconds. This can
+   *                        only be used for elapsed time calculations and has no meaning by itself
    */
-  protected void processRecords(ConsumerRecords<?, ?> records, Instant readTime) {
+  protected void processRecords(ConsumerRecords<?, ?> records, Instant readTime, long readTimeInNanos) {
     // send the batch out the other end
     translateAndSendBatch(records, readTime);
 
-    if (System.currentTimeMillis() - readTime.toEpochMilli() > _processingDelayLogThresholdMillis) {
+    if ((System.currentTimeMillis() - readTime.toEpochMilli()) > _processingDelayLogThresholdMillis) {
       _consumerMetrics.updateProcessingAboveThreshold(1);
+    }
+
+    if (_enableAdditionalMetrics) {
+      // Using millisecond precision is not good enough here. Per event processing time can be less than a millisecond
+      long processingTimeNanos = System.nanoTime() - readTimeInNanos;
+      _consumerMetrics.updatePerEventProcessingTimeNanos(records.count() == 0 ? 0 : processingTimeNanos / records.count());
     }
   }
 
@@ -603,6 +612,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
       try {
         if (offsets.isPresent()) {
           consumer.commitSync(offsets.get(), _commitTimeout);
+          _kafkaTopicPartitionTracker.onOffsetsCommitted(offsets.get());
         } else {
           consumer.commitSync(_commitTimeout);
         }
@@ -636,15 +646,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
     Map<TopicPartition, OffsetAndMetadata> lastCheckpoint = new HashMap<>();
     Set<TopicPartition> tpWithNoCommits = new HashSet<>();
     // construct last checkpoint
-    topicPartitions.forEach(tp -> {
-      OffsetAndMetadata offset = _consumer.committed(tp);
-      // offset can be null if there was no prior commit
-      if (offset == null) {
-        tpWithNoCommits.add(tp);
-      } else {
-        lastCheckpoint.put(tp, offset);
-      }
-    });
+    topicPartitions.forEach(tp -> getLastCheckpointToSeekTo(lastCheckpoint, tpWithNoCommits, tp));
     _logger.info("Seeking to previous checkpoints {}", lastCheckpoint);
     // reset consumer to last checkpoint, by default we will rewind the checkpoint
     lastCheckpoint.forEach((tp, offsetAndMetadata) -> _consumer.seek(tp, offsetAndMetadata.offset()));
@@ -652,6 +654,17 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
       _logger.info("Seeking to start position for partitions: {}", tpWithNoCommits);
       seekToStartPosition(_consumer, tpWithNoCommits,
           _consumerProps.getProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, CONSUMER_AUTO_OFFSET_RESET_CONFIG_EARLIEST));
+    }
+  }
+
+  protected void getLastCheckpointToSeekTo(Map<TopicPartition, OffsetAndMetadata> lastCheckpoint,
+      Set<TopicPartition> tpWithNoCommits, TopicPartition tp) {
+    OffsetAndMetadata offset = _consumer.committed(tp);
+    // offset can be null if there was no prior commit
+    if (offset == null) {
+      tpWithNoCommits.add(tp);
+    } else {
+      lastCheckpoint.put(tp, offset);
     }
   }
 
@@ -719,7 +732,7 @@ abstract public class AbstractKafkaBasedConnectorTask implements Runnable, Consu
   @Override
   public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
     this.onPartitionsAssignedInternal(partitions);
-    _logger.info("{} Partition ownership assigned for {}.", _datastreamTask.getDatastreamTaskName(), partitions);
+      _logger.info("{} Partition ownership assigned for {}.", _datastreamTask.getDatastreamTaskName(), partitions);
     _consumerMetrics.updateRebalanceRate(1);
     updateConsumerAssignment(partitions);
   }
